@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.replication.HReplicationServer;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -98,7 +99,6 @@ public class JVMClusterUtil {
     return new JVMClusterUtil.RegionServerThread(server, index);
   }
 
-
   /**
    * Datastructure to hold Master Thread and Master instance
    */
@@ -165,7 +165,8 @@ public class JVMClusterUtil {
    * @return Address to use contacting primary master.
    */
   public static String startup(final List<JVMClusterUtil.MasterThread> masters,
-      final List<JVMClusterUtil.RegionServerThread> regionservers) throws IOException {
+      final List<JVMClusterUtil.RegionServerThread> regionservers,
+      final List<JVMClusterUtil.RegionServerThread> replicationServers) throws IOException {
     // Implementation note: This method relies on timed sleeps in a loop. It's not great, and
     // should probably be re-written to use actual synchronization objects, but it's ok for now
 
@@ -191,6 +192,10 @@ public class JVMClusterUtil {
       for (JVMClusterUtil.RegionServerThread t: regionservers) {
         t.start();
       }
+    }
+
+    if (replicationServers != null) {
+      replicationServers.forEach(Thread::start);
     }
 
     // Wait for an active master to be initialized (implies being master)
@@ -246,7 +251,8 @@ public class JVMClusterUtil {
    * @param regionservers
    */
   public static void shutdown(final List<MasterThread> masters,
-      final List<RegionServerThread> regionservers) {
+      final List<RegionServerThread> regionservers,
+      final List<RegionServerThread> replicationServers) {
     LOG.debug("Shutting down HBase Cluster");
     if (masters != null) {
       // Do backups first.
@@ -329,6 +335,52 @@ public class JVMClusterUtil {
       }
     }
 
+    if (replicationServers != null) {
+      // first try nicely.
+      for (RegionServerThread t : replicationServers) {
+        t.getRegionServer().stop("Shutdown requested");
+      }
+      for (RegionServerThread t : replicationServers) {
+        long now = System.currentTimeMillis();
+        if (t.isAlive() && !wasInterrupted && now < maxTime) {
+          try {
+            t.join(maxTime - now);
+          } catch (InterruptedException e) {
+            LOG.info("Got InterruptedException on shutdown - " +
+                "not waiting anymore on region server ends", e);
+            wasInterrupted = true; // someone wants us to speed up.
+          }
+        }
+      }
+
+      // Let's try to interrupt the remaining threads if any.
+      for (int i = 0; i < 100; ++i) {
+        boolean atLeastOneLiveServer = false;
+        for (RegionServerThread t : replicationServers) {
+          if (t.isAlive()) {
+            atLeastOneLiveServer = true;
+            try {
+              LOG.warn("RegionServerThreads remaining, give one more chance before interrupting");
+              t.join(1000);
+            } catch (InterruptedException e) {
+              wasInterrupted = true;
+            }
+          }
+        }
+        if (!atLeastOneLiveServer) break;
+        for (RegionServerThread t : replicationServers) {
+          if (t.isAlive()) {
+            LOG.warn("RegionServerThreads taking too long to stop, interrupting; thread dump "  +
+                "if > 3 attempts: i=" + i);
+            if (i > 3) {
+              Threads.printThreadInfo(System.out, "Thread dump " + t.getName());
+            }
+            t.interrupt();
+          }
+        }
+      }
+    }
+
     if (masters != null) {
       for (JVMClusterUtil.MasterThread t : masters) {
         while (t.master.isAlive() && !wasInterrupted) {
@@ -345,10 +397,11 @@ public class JVMClusterUtil {
         }
       }
     }
-    LOG.info("Shutdown of " +
-      ((masters != null) ? masters.size() : "0") + " master(s) and " +
-      ((regionservers != null) ? regionservers.size() : "0") +
-      " regionserver(s) " + (wasInterrupted ? "interrupted" : "complete"));
+    LOG.info("Shutdown of {} master(s), {} regionserver(s) and {} replicationservers(s) {}",
+        ((masters != null) ? masters.size() : 0),
+        ((regionservers != null) ? regionservers.size() : 0),
+        ((replicationServers != null) ? replicationServers.size() : 0),
+        (wasInterrupted ? "interrupted" : "complete"));
 
     if (wasInterrupted){
       Thread.currentThread().interrupt();

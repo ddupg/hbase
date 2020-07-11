@@ -101,16 +101,32 @@ public class MiniHBaseCluster extends HBaseCluster {
    * @throws InterruptedException
    */
   public MiniHBaseCluster(Configuration conf, int numMasters, int numAlwaysStandByMasters,
-         int numRegionServers, List<Integer> rsPorts, Class<? extends HMaster> masterClass,
-         Class<? extends MiniHBaseCluster.MiniHBaseClusterRegionServer> regionserverClass)
+      int numRegionServers, List<Integer> rsPorts, Class<? extends HMaster> masterClass,
+      Class<? extends MiniHBaseCluster.MiniHBaseClusterRegionServer> regionserverClass)
       throws IOException, InterruptedException {
+    this(conf, numMasters, numAlwaysStandByMasters, numRegionServers, rsPorts, masterClass,
+        regionserverClass, 0);
+  }
+
+  /**
+   * @param rsPorts Ports that RegionServer should use; pass ports if you want to test cluster
+   *   restart where for sure the regionservers come up on same address+port (but
+   *   just with different startcode); by default mini hbase clusters choose new
+   *   arbitrary ports on each cluster start.
+   * @throws IOException
+   * @throws InterruptedException
+   */
+  public MiniHBaseCluster(Configuration conf, int numMasters, int numAlwaysStandByMasters,
+      int numRegionServers, List<Integer> rsPorts, Class<? extends HMaster> masterClass,
+      Class<? extends MiniHBaseCluster.MiniHBaseClusterRegionServer> regionserverClass,
+      int numReplicationServers) throws IOException, InterruptedException {
     super(conf);
 
     // Hadoop 2
     CompatibilityFactory.getInstance(MetricsAssertHelper.class).init();
 
     init(numMasters, numAlwaysStandByMasters, numRegionServers, rsPorts, masterClass,
-        regionserverClass);
+        regionserverClass, numReplicationServers);
     this.initialClusterStatus = getClusterMetrics();
   }
 
@@ -228,8 +244,8 @@ public class MiniHBaseCluster extends HBaseCluster {
 
   private void init(final int nMasterNodes, final int numAlwaysStandByMasters,
       final int nRegionNodes, List<Integer> rsPorts, Class<? extends HMaster> masterClass,
-      Class<? extends MiniHBaseCluster.MiniHBaseClusterRegionServer> regionserverClass)
-  throws IOException, InterruptedException {
+      Class<? extends MiniHBaseCluster.MiniHBaseClusterRegionServer> regionserverClass,
+      int nReplicationNodes) throws IOException, InterruptedException {
     try {
       if (masterClass == null){
         masterClass =  HMaster.class;
@@ -240,7 +256,7 @@ public class MiniHBaseCluster extends HBaseCluster {
 
       // start up a LocalHBaseCluster
       hbaseCluster = new LocalHBaseCluster(conf, nMasterNodes, numAlwaysStandByMasters, 0,
-          masterClass, regionserverClass);
+          masterClass, regionserverClass, nReplicationNodes);
 
       // manually add the regionservers as other users
       for (int i = 0; i < nRegionNodes; i++) {

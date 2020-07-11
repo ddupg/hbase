@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import org.apache.hadoop.hbase.replication.HReplicationServer;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +62,8 @@ public class LocalHBaseCluster {
   private static final Logger LOG = LoggerFactory.getLogger(LocalHBaseCluster.class);
   private final List<JVMClusterUtil.MasterThread> masterThreads = new CopyOnWriteArrayList<>();
   private final List<JVMClusterUtil.RegionServerThread> regionThreads = new CopyOnWriteArrayList<>();
+  private final List<JVMClusterUtil.RegionServerThread> replicationThreads =
+      new CopyOnWriteArrayList<>();
   private final static int DEFAULT_NO = 1;
   /** local mode */
   public static final String LOCAL = "local";
@@ -71,6 +74,8 @@ public class LocalHBaseCluster {
   private final Configuration conf;
   private final Class<? extends HMaster> masterClass;
   private final Class<? extends HRegionServer> regionServerClass;
+  private final Class<? extends HReplicationServer> replicationServerClass =
+      HReplicationServer.class;
 
   /**
    * Constructor.
@@ -128,6 +133,13 @@ public class LocalHBaseCluster {
     this(conf, noMasters, 0, noRegionServers, masterClass, regionServerClass);
   }
 
+  public LocalHBaseCluster(final Configuration conf, final int noMasters,
+      final int noAlwaysStandByMasters, final int noRegionServers,
+      final Class<? extends HMaster> masterClass,
+      final Class<? extends HRegionServer> regionServerClass) throws IOException {
+    this(conf, noMasters, noAlwaysStandByMasters, noRegionServers, masterClass, regionServerClass, 0);
+  }
+
   /**
    * Constructor.
    * @param conf Configuration to use.  Post construction has the master's
@@ -136,13 +148,15 @@ public class LocalHBaseCluster {
    * @param noRegionServers Count of regionservers to start.
    * @param masterClass
    * @param regionServerClass
+   * @param noReplicationServers Count of replicationservers to start
    * @throws IOException
    */
   @SuppressWarnings("unchecked")
   public LocalHBaseCluster(final Configuration conf, final int noMasters,
       final int noAlwaysStandByMasters, final int noRegionServers,
       final Class<? extends HMaster> masterClass,
-      final Class<? extends HRegionServer> regionServerClass) throws IOException {
+      final Class<? extends HRegionServer> regionServerClass, final int noReplicationServers)
+      throws IOException {
     this.conf = conf;
 
     // When active, if a port selection is default then we switch to random
@@ -192,6 +206,10 @@ public class LocalHBaseCluster {
 
     for (int j = 0; j < noRegionServers; j++) {
       addRegionServer(new Configuration(conf), j);
+    }
+
+    for (int j = 0; j < noReplicationServers; j++) {
+      addReplicationServer(new Configuration(conf), j);
     }
   }
 
@@ -257,6 +275,22 @@ public class LocalHBaseCluster {
             return addMaster(c, index);
           }
         });
+  }
+
+  @SuppressWarnings("unchecked")
+  public JVMClusterUtil.RegionServerThread addReplicationServer(
+      Configuration config, final int index)
+      throws IOException {
+    // Create each replicationserver with its own Configuration instance so each has
+    // its Connection instance rather than share (see HBASE_INSTANCES down in
+    // the guts of ConnectionManager).
+    JVMClusterUtil.RegionServerThread rst =
+        JVMClusterUtil.createRegionServerThread(config, (Class<? extends HRegionServer>) conf
+                .getClass(HReplicationServer.REPLICATION_SERVER_IMPL, this.replicationServerClass),
+            index);
+
+    this.replicationThreads.add(rst);
+    return rst;
   }
 
   /**
@@ -398,12 +432,53 @@ public class LocalHBaseCluster {
   }
 
   /**
+   * @param serverNumber
+   * @return region server
+   */
+  public HRegionServer getReplicationServer(int serverNumber) {
+    return replicationThreads.get(serverNumber).getRegionServer();
+  }
+
+  /**
+   * @return Read-only list of region server threads.
+   */
+  public List<JVMClusterUtil.RegionServerThread> getReplicationServers() {
+    return Collections.unmodifiableList(this.replicationThreads);
+  }
+
+  /**
+   * @return List of running servers (Some servers may have been killed or
+   * aborted during lifetime of cluster; these servers are not included in this
+   * list).
+   */
+  public List<JVMClusterUtil.RegionServerThread> getLiveReplicationServers() {
+    List<JVMClusterUtil.RegionServerThread> liveServers = new ArrayList<>();
+    List<RegionServerThread> list = getReplicationServers();
+    for (JVMClusterUtil.RegionServerThread rst: list) {
+      if (rst.isAlive()) liveServers.add(rst);
+      else LOG.info("Not alive " + rst.getName());
+    }
+    return liveServers;
+  }
+
+  /**
    * Wait for Mini HBase Cluster to shut down.
    * Presumes you've already called {@link #shutdown()}.
    */
   public void join() {
     if (this.regionThreads != null) {
       for(Thread t: this.regionThreads) {
+        if (t.isAlive()) {
+          try {
+            Threads.threadDumpingIsAlive(t);
+          } catch (InterruptedException e) {
+            LOG.debug("Interrupted", e);
+          }
+        }
+      }
+    }
+    if (this.replicationThreads != null) {
+      for(Thread t: this.replicationThreads) {
         if (t.isAlive()) {
           try {
             Threads.threadDumpingIsAlive(t);
@@ -430,14 +505,14 @@ public class LocalHBaseCluster {
    * Start the cluster.
    */
   public void startup() throws IOException {
-    JVMClusterUtil.startup(this.masterThreads, this.regionThreads);
+    JVMClusterUtil.startup(this.masterThreads, this.regionThreads, this.replicationThreads);
   }
 
   /**
    * Shut down the mini HBase cluster
    */
   public void shutdown() {
-    JVMClusterUtil.shutdown(this.masterThreads, this.regionThreads);
+    JVMClusterUtil.shutdown(this.masterThreads, this.regionThreads, this.replicationThreads);
   }
 
   /**

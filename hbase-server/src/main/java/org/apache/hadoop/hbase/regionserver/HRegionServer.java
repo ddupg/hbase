@@ -406,7 +406,7 @@ public class HRegionServer extends Thread implements
   private RemoteProcedureResultReporter procedureResultReporter;
 
   // flag set after we're done setting up server threads
-  final AtomicBoolean online = new AtomicBoolean(false);
+  protected final AtomicBoolean online = new AtomicBoolean(false);
 
   // zookeeper connection and watcher
   protected final ZKWatcher zooKeeper;
@@ -958,25 +958,7 @@ public class HRegionServer extends Thread implements
         // node was created, in case any coprocessors want to use ZooKeeper
         this.rsHost = new RegionServerCoprocessorHost(this, this.conf);
 
-        // Try and register with the Master; tell it we are here.  Break if server is stopped or
-        // the clusterup flag is down or hdfs went wacky. Once registered successfully, go ahead and
-        // start up all Services. Use RetryCounter to get backoff in case Master is struggling to
-        // come up.
-        LOG.debug("About to register with Master.");
-        RetryCounterFactory rcf =
-          new RetryCounterFactory(Integer.MAX_VALUE, this.sleeper.getPeriod(), 1000 * 60 * 5);
-        RetryCounter rc = rcf.create();
-        while (keepLooping()) {
-          RegionServerStartupResponse w = reportForDuty();
-          if (w == null) {
-            long sleepTime = rc.getBackoffTimeAndIncrementAttempts();
-            LOG.warn("reportForDuty failed; sleeping {} ms and then retrying.", sleepTime);
-            this.sleeper.sleep(sleepTime);
-          } else {
-            handleReportForDutyResponse(w);
-            break;
-          }
-        }
+        registerWithMaster();
       }
 
       if (!isStopped() && isHealthy()) {
@@ -1631,7 +1613,7 @@ public class HRegionServer extends Thread implements
     }
   }
 
-  private void createMyEphemeralNode() throws KeeperException {
+  protected void createMyEphemeralNode() throws KeeperException {
     RegionServerInfo.Builder rsInfo = RegionServerInfo.newBuilder();
     rsInfo.setInfoPort(infoServer != null ? infoServer.getPort() : -1);
     rsInfo.setVersionInfo(ProtobufUtil.getVersionInfo());
@@ -1866,7 +1848,7 @@ public class HRegionServer extends Thread implements
    * Setup WAL log and replication if enabled. Replication setup is done in here because it wants to
    * be hooked up to WAL.
    */
-  private void setupWALAndReplication() throws IOException {
+  protected void setupWALAndReplication() throws IOException {
     boolean isMasterNoTableOrSystemTableOnly = this instanceof HMaster &&
         !LoadBalancer.isMasterCanHostUserRegions(conf);
     WALFactory factory =
@@ -1897,7 +1879,7 @@ public class HRegionServer extends Thread implements
   /**
    * Start up replication source and sink handlers.
    */
-  private void startReplicationService() throws IOException {
+  protected void startReplicationService() throws IOException {
     if (this.replicationSourceHandler == this.replicationSinkHandler &&
         this.replicationSourceHandler != null) {
       this.replicationSourceHandler.startReplicationService();
@@ -2725,6 +2707,31 @@ public class HRegionServer extends Thread implements
     this.rssStub = intRssStub;
     this.lockStub = intLockStub;
     return sn;
+  }
+
+  /**
+   * Try and register with the Master; tell it we are here.  Break if server is stopped or
+   * the clusterup flag is down or hdfs went wacky. Once registered successfully, go ahead and
+   * start up all Services. Use RetryCounter to get backoff in case Master is struggling to
+   * come up.
+   * @throws IOException
+   */
+  protected void registerWithMaster() throws IOException {
+    LOG.debug("About to register with Master.");
+    RetryCounterFactory rcf =
+        new RetryCounterFactory(Integer.MAX_VALUE, this.sleeper.getPeriod(), 1000 * 60 * 5);
+    RetryCounter rc = rcf.create();
+    while (keepLooping()) {
+      RegionServerStartupResponse w = reportForDuty();
+      if (w == null) {
+        long sleepTime = rc.getBackoffTimeAndIncrementAttempts();
+        LOG.warn("reportForDuty failed; sleeping {} ms and then retrying.", sleepTime);
+        this.sleeper.sleep(sleepTime);
+      } else {
+        handleReportForDutyResponse(w);
+        break;
+      }
+    }
   }
 
   /**
@@ -3577,7 +3584,7 @@ public class HRegionServer extends Thread implements
     }
   }
 
-  private String getMyEphemeralNodePath() {
+  protected String getMyEphemeralNodePath() {
     return ZNodePaths.joinZNode(this.zooKeeper.getZNodePaths().rsZNode, getServerName().toString());
   }
 

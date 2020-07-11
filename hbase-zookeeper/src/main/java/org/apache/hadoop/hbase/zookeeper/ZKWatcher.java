@@ -204,6 +204,7 @@ public class ZKWatcher implements Watcher, Abortable, Closeable {
       ZKUtil.createAndFailSilent(this, znodePaths.splitLogZNode);
       ZKUtil.createAndFailSilent(this, znodePaths.backupMasterAddressesZNode);
       ZKUtil.createAndFailSilent(this, znodePaths.masterMaintZNode);
+      ZKUtil.createAndFailSilent(this, znodePaths.replicationServerZNode);
     } catch (KeeperException e) {
       throw new ZooKeeperConnectionException(
           prefix("Unexpected KeeperException creating base node"), e);

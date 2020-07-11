@@ -45,6 +45,10 @@ public class ZNodePaths {
   public static final String META_ZNODE_PREFIX = "meta-region-server";
   private static final String DEFAULT_SNAPSHOT_CLEANUP_ZNODE = "snapshot-cleanup";
 
+  public static final String REPLICATION_SERVER_ZNODE_CONF_KEY =
+      "zookeeper.znode.replicationserver";
+  public static final String DEFAULT_REPLICATION_SERVER_ZNODE_CONF = "replicationserver";
+
   // base znode for this cluster
   public final String baseZNode;
 
@@ -102,6 +106,9 @@ public class ZNodePaths {
   // znode containing the state of the snapshot auto-cleanup
   final String snapshotCleanupZNode;
 
+  // znode containing ephemeral nodes of the replication servers
+  public final String replicationServerZNode;
+
   public ZNodePaths(Configuration conf) {
     baseZNode = conf.get(ZOOKEEPER_ZNODE_PARENT, DEFAULT_ZOOKEEPER_ZNODE_PARENT);
     ImmutableMap.Builder<Integer, String> builder = ImmutableMap.builder();
@@ -136,6 +143,8 @@ public class ZNodePaths {
       conf.get("zookeeper.znode.replication.hfile.refs", "hfile-refs"));
     snapshotCleanupZNode = joinZNode(baseZNode,
         conf.get("zookeeper.znode.snapshot.cleanup", DEFAULT_SNAPSHOT_CLEANUP_ZNODE));
+    replicationServerZNode = joinZNode(baseZNode,
+        conf.get(REPLICATION_SERVER_ZNODE_CONF_KEY, DEFAULT_REPLICATION_SERVER_ZNODE_CONF));
   }
 
   @Override
@@ -161,6 +170,7 @@ public class ZNodePaths {
         .append(", queuesZNode=").append(queuesZNode)
         .append(", hfileRefsZNode=").append(hfileRefsZNode)
         .append(", snapshotCleanupZNode=").append(snapshotCleanupZNode)
+        .append(", replicationServerZNode=").append(replicationServerZNode)
         .append("]").toString();
   }
 

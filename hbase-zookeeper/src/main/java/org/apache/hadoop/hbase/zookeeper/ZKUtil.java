@@ -1876,6 +1876,14 @@ public final class ZKUtil {
           sb.append("\n ").append(child);
         }
       }
+      sb.append("\nReplication servers:");
+      final List<String> replicationServerChildrenNoWatchList =
+          listChildrenNoWatch(zkw, zkw.getZNodePaths().replicationServerZNode);
+      if (replicationServerChildrenNoWatchList != null) {
+        for (String child : replicationServerChildrenNoWatchList) {
+          sb.append("\n ").append(child);
+        }
+      }
       try {
         getReplicationZnodesDump(zkw, sb);
       } catch (KeeperException ke) {

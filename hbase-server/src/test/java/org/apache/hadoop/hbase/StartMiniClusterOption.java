@@ -105,12 +105,18 @@ public final class StartMiniClusterOption {
   private final boolean createWALDir;
 
   /**
+   * Number of replication servers to start up.
+   */
+  private final int numReplicationServers;
+
+  /**
    * Private constructor. Use {@link Builder#build()}.
    */
   private StartMiniClusterOption(int numMasters, int numAlwaysStandByMasters,
       Class<? extends HMaster> masterClass, int numRegionServers, List<Integer> rsPorts,
       Class<? extends MiniHBaseCluster.MiniHBaseClusterRegionServer> rsClass, int numDataNodes,
-      String[] dataNodeHosts, int numZkServers, boolean createRootDir, boolean createWALDir) {
+      String[] dataNodeHosts, int numZkServers, boolean createRootDir, boolean createWALDir,
+      int numReplicationServers) {
     this.numMasters = numMasters;
     this.numAlwaysStandByMasters = numAlwaysStandByMasters;
     this.masterClass = masterClass;
@@ -122,6 +128,7 @@ public final class StartMiniClusterOption {
     this.numZkServers = numZkServers;
     this.createRootDir = createRootDir;
     this.createWALDir = createWALDir;
+    this.numReplicationServers = numReplicationServers;
   }
 
   public int getNumMasters() {
@@ -168,13 +175,18 @@ public final class StartMiniClusterOption {
     return createWALDir;
   }
 
+  public int getNumReplicationServers() {
+    return numReplicationServers;
+  }
+
   @Override
   public String toString() {
     return "StartMiniClusterOption{" + "numMasters=" + numMasters + ", masterClass=" + masterClass
         + ", numRegionServers=" + numRegionServers + ", rsPorts=" + StringUtils.join(rsPorts)
         + ", rsClass=" + rsClass + ", numDataNodes=" + numDataNodes
         + ", dataNodeHosts=" + Arrays.toString(dataNodeHosts) + ", numZkServers=" + numZkServers
-        + ", createRootDir=" + createRootDir + ", createWALDir=" + createWALDir + '}';
+        + ", createRootDir=" + createRootDir + ", createWALDir=" + createWALDir
+        + ", numReplicationServers=" + numReplicationServers + '}';
   }
 
   /**
@@ -202,6 +214,7 @@ public final class StartMiniClusterOption {
     private int numZkServers = 1;
     private boolean createRootDir = false;
     private boolean createWALDir = false;
+    private int numReplicationServers = 0;
 
     private Builder() {
     }
@@ -212,7 +225,7 @@ public final class StartMiniClusterOption {
       }
       return new StartMiniClusterOption(numMasters,numAlwaysStandByMasters, masterClass,
           numRegionServers, rsPorts, rsClass, numDataNodes, dataNodeHosts, numZkServers,
-          createRootDir, createWALDir);
+          createRootDir, createWALDir, numReplicationServers);
     }
 
     public Builder numMasters(int numMasters) {
@@ -267,6 +280,11 @@ public final class StartMiniClusterOption {
 
     public Builder createWALDir(boolean createWALDir) {
       this.createWALDir = createWALDir;
+      return this;
+    }
+
+    public Builder numReplicationServers(int numReplicationServers) {
+      this.numReplicationServers = numReplicationServers;
       return this;
     }
   }

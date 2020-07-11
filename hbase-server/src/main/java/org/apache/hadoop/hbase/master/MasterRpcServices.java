@@ -119,6 +119,7 @@ import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.hbase.thirdparty.com.google.common.collect.Lists;
 import org.apache.hbase.thirdparty.com.google.common.collect.Sets;
 import org.apache.hbase.thirdparty.com.google.protobuf.Descriptors.MethodDescriptor;
 import org.apache.hbase.thirdparty.com.google.protobuf.Descriptors.ServiceDescriptor;
@@ -383,6 +384,13 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationProtos.Trans
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationProtos.TransitReplicationPeerSyncReplicationStateResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationProtos.UpdateReplicationPeerConfigRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationProtos.UpdateReplicationPeerConfigResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationServerStatusProtos.ReplicationServerReportRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationServerStatusProtos.ReplicationServerReportResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationServerStatusProtos.ReplicationServerStartupRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationServerStatusProtos.ReplicationServerStartupResponse;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationServerStatusProtos.ReplicationServerStatusService;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationServerStatusProtos.ReportReplicationServerFatalErrorRequest;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ReplicationServerStatusProtos.ReportReplicationServerFatalErrorResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.SnapshotProtos.SnapshotDescription;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.VisibilityLabelsProtos.VisibilityLabelsService;
 
@@ -394,7 +402,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.VisibilityLabelsProtos.
 public class MasterRpcServices extends RSRpcServices implements
     MasterService.BlockingInterface, RegionServerStatusService.BlockingInterface,
     LockService.BlockingInterface, HbckService.BlockingInterface,
-    ClientMetaService.BlockingInterface {
+    ClientMetaService.BlockingInterface, ReplicationServerStatusService.BlockingInterface {
 
   private static final Logger LOG = LoggerFactory.getLogger(MasterRpcServices.class.getName());
   private static final Logger AUDITLOG =
@@ -403,23 +411,20 @@ public class MasterRpcServices extends RSRpcServices implements
   private final HMaster master;
 
   /**
-   * @return Subset of configuration to pass initializing regionservers: e.g.
+   * @return Subset of configuration to pass initializing regionservers or replicationserver: e.g.
    *     the filesystem to use and root directory to use.
    */
-  private RegionServerStartupResponse.Builder createConfigurationSubset() {
-    RegionServerStartupResponse.Builder resp = addConfig(
-      RegionServerStartupResponse.newBuilder(), HConstants.HBASE_DIR);
-    resp = addConfig(resp, "fs.defaultFS");
-    return addConfig(resp, "hbase.master.info.port");
+  private List<NameStringPair> getConfigurationSubset() {
+    return Lists.newArrayList(
+        getConfig(HConstants.HBASE_DIR),
+        getConfig("fs.defaultFS"),
+        getConfig("hbase.master.info.port"));
   }
 
-  private RegionServerStartupResponse.Builder addConfig(
-      final RegionServerStartupResponse.Builder resp, final String key) {
-    NameStringPair.Builder entry = NameStringPair.newBuilder()
-      .setName(key)
-      .setValue(master.getConfiguration().get(key));
-    resp.addMapEntries(entry.build());
-    return resp;
+  private NameStringPair getConfig(final String key) {
+    return NameStringPair.newBuilder()
+        .setName(key)
+        .setValue(master.getConfiguration().get(key)).build();
   }
 
   public MasterRpcServices(HMaster m) throws IOException {
@@ -611,7 +616,8 @@ public class MasterRpcServices extends RSRpcServices implements
         master.getServerManager().regionServerStartup(request, versionNumber, version, ia);
 
       // Send back some config info
-      RegionServerStartupResponse.Builder resp = createConfigurationSubset();
+      RegionServerStartupResponse.Builder resp = RegionServerStartupResponse.newBuilder()
+          .addAllMapEntries(getConfigurationSubset());
       NameStringPair.Builder entry = NameStringPair.newBuilder()
         .setName(HConstants.KEY_FOR_HOSTNAME_SEEN_BY_MASTER).setValue(rs.getHostname());
       resp.addMapEntries(entry.build());
@@ -3273,5 +3279,58 @@ public class MasterRpcServices extends RSRpcServices implements
       throw new ServiceException(e);
     }
     return builder.build();
+  }
+
+  @Override
+  public ReplicationServerStartupResponse replicationServerStartup(RpcController controller,
+      ReplicationServerStartupRequest request) throws ServiceException {
+    // Register with server manager
+    try {
+      master.checkServiceStarted();
+      int versionNumber = 0;
+      String version = "0.0.0";
+      VersionInfo versionInfo = VersionInfoUtil.getCurrentClientVersionInfo();
+      if (versionInfo != null) {
+        version = versionInfo.getVersion();
+        versionNumber = VersionInfoUtil.getVersionNumber(versionInfo);
+      }
+      InetAddress ia = master.getRemoteInetAddress(request.getPort(), request.getServerStartCode());
+      // if regionserver passed hostname to use,
+      // then use it instead of doing a reverse DNS lookup
+      // TODO: 2020/7/11 check in serverManager
+      ServerName rs = null;
+//          master.getServerManager().regionServerStartup(request, versionNumber, version, ia);
+
+      // Send back some config info
+      ReplicationServerStartupResponse.Builder resp = ReplicationServerStartupResponse.newBuilder()
+          .addAllMapEntries(getConfigurationSubset());
+      NameStringPair.Builder entry = NameStringPair.newBuilder()
+          .setName(HConstants.KEY_FOR_HOSTNAME_SEEN_BY_MASTER).setValue(rs.getHostname());
+      resp.addMapEntries(entry.build());
+
+      return resp.build();
+    } catch (IOException ioe) {
+      throw new ServiceException(ioe);
+    }
+  }
+
+  @Override
+  public ReplicationServerReportResponse replicationServerReport(RpcController controller,
+      ReplicationServerReportRequest request) throws ServiceException {
+    // TODO: 2020/7/11 send to server manager
+    return ReplicationServerReportResponse.newBuilder().build();
+  }
+
+  @Override
+  public ReportReplicationServerFatalErrorResponse
+  reportReplicationServerFatalError(RpcController controller,
+      ReportReplicationServerFatalErrorRequest request) throws ServiceException {
+    String errorText = request.getErrorMessage();
+    ServerName sn = ProtobufUtil.toServerName(request.getServer());
+    String msg = sn + " reported a fatal error:\n" + errorText;
+    LOG.warn(msg);
+    // TODO: 2020/7/11 master needs to know this
+//    master.rsFatals.add(msg);
+    return ReportReplicationServerFatalErrorResponse.newBuilder().build();
   }
 }
