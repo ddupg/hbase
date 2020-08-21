@@ -55,7 +55,7 @@ public class TestClockSkewDetection {
     request.setPort(1234);
     request.setServerStartCode(-1);
     request.setServerCurrentTime(System.currentTimeMillis());
-    sm.regionServerStartup(request.build(), 0, "0.0.0", ia1);
+    sm.serverStartup(request.build(), 0, "0.0.0", ia1);
 
     final Configuration c = HBaseConfiguration.create();
     long maxSkew = c.getLong("hbase.master.maxclockskew", 30000);
@@ -70,7 +70,7 @@ public class TestClockSkewDetection {
       request.setPort(1235);
       request.setServerStartCode(-1);
       request.setServerCurrentTime(System.currentTimeMillis() - maxSkew * 2);
-      sm.regionServerStartup(request.build(), 0, "0.0.0", ia2);
+      sm.serverStartup(request.build(), 0, "0.0.0", ia2);
       fail("HMaster should have thrown a ClockOutOfSyncException but didn't.");
     } catch(ClockOutOfSyncException e) {
       //we want an exception
@@ -86,7 +86,7 @@ public class TestClockSkewDetection {
       request.setPort(1236);
       request.setServerStartCode(-1);
       request.setServerCurrentTime(System.currentTimeMillis() + maxSkew * 2);
-      sm.regionServerStartup(request.build(), 0, "0.0.0", ia3);
+      sm.serverStartup(request.build(), 0, "0.0.0", ia3);
       fail("HMaster should have thrown a ClockOutOfSyncException but didn't.");
     } catch (ClockOutOfSyncException e) {
       // we want an exception
@@ -100,7 +100,7 @@ public class TestClockSkewDetection {
     request.setPort(1237);
     request.setServerStartCode(-1);
     request.setServerCurrentTime(System.currentTimeMillis() - warningSkew * 2);
-    sm.regionServerStartup(request.build(), 0, "0.0.0", ia4);
+    sm.serverStartup(request.build(), 0, "0.0.0", ia4);
 
     // make sure values above warning threshold but below max threshold don't kill
     LOG.debug("regionServerStartup 5");
@@ -109,6 +109,6 @@ public class TestClockSkewDetection {
     request.setPort(1238);
     request.setServerStartCode(-1);
     request.setServerCurrentTime(System.currentTimeMillis() + warningSkew * 2);
-    sm.regionServerStartup(request.build(), 0, "0.0.0", ia5);
+    sm.serverStartup(request.build(), 0, "0.0.0", ia5);
   }
 }

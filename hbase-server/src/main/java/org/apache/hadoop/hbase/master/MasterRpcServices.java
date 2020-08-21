@@ -577,7 +577,7 @@ public class MasterRpcServices extends RSRpcServices implements
       ServerMetrics oldLoad = master.getServerManager().getLoad(serverName);
       ServerMetrics newLoad =
         ServerMetricsBuilder.toServerMetrics(serverName, versionNumber, version, sl);
-      master.getServerManager().regionServerReport(serverName, newLoad);
+      master.getServerManager().serverReport(serverName, newLoad);
       master.getAssignmentManager().reportOnlineRegions(serverName,
         newLoad.getRegionMetrics().keySet());
       if (sl != null && master.metricsMaster != null) {
@@ -608,7 +608,7 @@ public class MasterRpcServices extends RSRpcServices implements
       // if regionserver passed hostname to use,
       // then use it instead of doing a reverse DNS lookup
       ServerName rs =
-        master.getServerManager().regionServerStartup(request, versionNumber, version, ia);
+        master.getServerManager().serverStartup(request, versionNumber, version, ia);
 
       // Send back some config info
       RegionServerStartupResponse.Builder resp = createConfigurationSubset();
