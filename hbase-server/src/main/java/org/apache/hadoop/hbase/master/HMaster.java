@@ -3637,9 +3637,13 @@ public class HMaster extends HRegionServer implements MasterServices {
         new HashMap<>(peerList.size());
     peerList.stream()
         .forEach(peer -> replicationLoadSourceMap.put(peer.getPeerId(), new ArrayList<>()));
+    boolean offloadEnabled = ReplicationUtils.isReplicationOffloadEnabled(conf);
     for (ServerName serverName : serverNames) {
+      ServerMetrics serverMetrics = offloadEnabled ?
+          getReplicationServerManager().getServerMetrics(serverName) :
+          getServerManager().getLoad(serverName);
       List<ReplicationLoadSource> replicationLoadSources =
-          getServerManager().getLoad(serverName).getReplicationLoadSourceList();
+          serverMetrics.getReplicationLoadSourceList();
       for (ReplicationLoadSource replicationLoadSource : replicationLoadSources) {
         replicationLoadSourceMap.get(replicationLoadSource.getPeerID())
             .add(new Pair<>(serverName, replicationLoadSource));
@@ -3772,6 +3776,10 @@ public class HMaster extends HRegionServer implements MasterServices {
 
   @Override
   public List<ServerName> listReplicationSinkServers() throws IOException {
-    return this.serverManager.getOnlineServersList();
+    if (ReplicationUtils.isReplicationOffloadEnabled(conf)) {
+      return this.replicationServerManager.getOnlineServersList();
+    } else {
+      return this.serverManager.getOnlineServersList();
+    }
   }
 }

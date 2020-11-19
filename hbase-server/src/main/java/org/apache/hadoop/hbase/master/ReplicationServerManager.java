@@ -182,6 +182,14 @@ public class ReplicationServerManager {
     return this.onlineServers.get(serverName);
   }
 
+  /**
+   * May return "0.0.0" when server is not online
+   */
+  public String getVersion(ServerName serverName) {
+    ServerMetrics serverMetrics = onlineServers.get(serverName);
+    return serverMetrics != null ? serverMetrics.getVersion() : "0.0.0";
+  }
+
   private class OnlineServerRefresher extends ScheduledChore {
 
     public OnlineServerRefresher(String name, int p) {

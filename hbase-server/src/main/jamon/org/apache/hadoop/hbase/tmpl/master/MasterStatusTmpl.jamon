@@ -27,6 +27,7 @@ String filter = "general";
 String format = "html";
 ServerManager serverManager = null;
 AssignmentManager assignmentManager = null;
+List<ServerName> replicationServers = null;
 </%args>
 <%import>
 java.util.*;
@@ -36,6 +37,7 @@ org.apache.hadoop.hbase.client.RegionInfo;
 org.apache.hadoop.hbase.client.TableDescriptor;
 org.apache.hadoop.hbase.replication.ReplicationPeerConfig;
 org.apache.hadoop.hbase.replication.ReplicationPeerDescription;
+org.apache.hadoop.hbase.replication.ReplicationUtils;
 org.apache.hadoop.hbase.HBaseConfiguration;
 org.apache.hadoop.hbase.HConstants;
 org.apache.hadoop.hbase.NamespaceDescriptor;
@@ -241,6 +243,16 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
                 <& deadRegionServers &>
             </%if>
         </section>
+<%java>
+        if (ReplicationUtils.isReplicationOffloadEnabled(master.getConfiguration())) {
+</%java>
+        <section>
+            <h2><a name="replicationservers">Replication Servers</a></h2>
+            <& ReplicationServerListTmpl; master= master; servers = replicationServers &>
+        </section>
+<%java>
+        }
+</%java>
         <section>
             <& BackupMasterStatusTmpl; master = master &>
         </section>

@@ -3396,7 +3396,7 @@ public class MasterRpcServices extends RSRpcServices implements
       if (master.getMasterCoprocessorHost() != null) {
         master.getMasterCoprocessorHost().preListReplicationSinkServers();
       }
-      builder.addAllServerName(master.getReplicationServerManager().getOnlineServersList().stream()
+      builder.addAllServerName(master.listReplicationSinkServers().stream()
         .map(ProtobufUtil::toServerName).collect(Collectors.toList()));
       if (master.getMasterCoprocessorHost() != null) {
         master.getMasterCoprocessorHost().postListReplicationSinkServers();

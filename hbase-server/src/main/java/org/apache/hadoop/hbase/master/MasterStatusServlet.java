@@ -55,6 +55,7 @@ public class MasterStatusServlet extends HttpServlet {
     ServerName metaLocation = null;
     List<ServerName> servers = null;
     Set<ServerName> deadServers = null;
+    List<ServerName> replicationServers = null;
     
     if(master.isActiveMaster()) {
       metaLocation = getMetaLocationOrNull(master);
@@ -62,6 +63,10 @@ public class MasterStatusServlet extends HttpServlet {
       if (serverManager != null) {
         deadServers = serverManager.getDeadServers().copyServerNames();
         servers = serverManager.getOnlineServersList();
+      }
+      ReplicationServerManager replicationServerManager = master.getReplicationServerManager();
+      if (replicationServerManager != null) {
+        replicationServers = replicationServerManager.getOnlineServersList();
       }
     }
 

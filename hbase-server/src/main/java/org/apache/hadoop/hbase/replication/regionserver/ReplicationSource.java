@@ -229,8 +229,7 @@ public class ReplicationSource implements ReplicationSourceInterface {
     this.abortOnError = this.conf.getBoolean("replication.source.regionserver.abort",
       true);
 
-    if (conf.getBoolean(HConstants.REPLICATION_OFFLOAD_ENABLE_KEY,
-      HConstants.REPLICATION_OFFLOAD_ENABLE_DEFAULT)) {
+    if (ReplicationUtils.isReplicationOffloadEnabled(conf)) {
       if (queueStorage instanceof ZKReplicationQueueStorage) {
         ZKReplicationQueueStorage zkQueueStorage = (ZKReplicationQueueStorage) queueStorage;
         zkQueueStorage.getZookeeper().registerListener(
