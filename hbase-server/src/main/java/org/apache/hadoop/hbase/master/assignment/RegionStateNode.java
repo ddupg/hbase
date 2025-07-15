@@ -178,7 +178,11 @@ public class RegionStateNode implements Comparable<RegionStateNode> {
 
   public long getLastUpdate() {
     TransitRegionStateProcedure proc = this.procedure;
-    return proc != null ? proc.getLastUpdate() : lastUpdate;
+    if (proc != null) {
+      long lastUpdate = proc.getLastUpdate();
+      return lastUpdate != 0 ? lastUpdate : proc.getSubmittedTime();
+    }
+    return lastUpdate;
   }
 
   public void setLastHost(final ServerName serverName) {
@@ -238,6 +242,14 @@ public class RegionStateNode implements Comparable<RegionStateNode> {
 
   public ServerName getRegionLocation() {
     return regionLocation;
+  }
+
+  public String getRegionServerName() {
+    ServerName sn = getRegionLocation();
+    if (sn != null) {
+      return sn.getServerName();
+    }
+    return null;
   }
 
   public State getState() {

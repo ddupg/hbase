@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import org.apache.hadoop.hbase.exceptions.TimeoutIOException;
 import org.apache.hadoop.hbase.metrics.Counter;
 import org.apache.hadoop.hbase.metrics.Histogram;
@@ -33,6 +34,7 @@ import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ProcedureProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.ProcedureProtos.ProcedureState;
 
 /**
@@ -341,6 +343,25 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure<TE
    * Called when the procedure is ready to be added to the queue after the loading/replay operation.
    */
   protected void afterReplay(TEnvironment env) {
+    // no-op
+  }
+
+  /**
+   * Called before we call the execute method of this procedure, but after we acquire the execution
+   * lock and procedure scheduler lock.
+   */
+  protected void beforeExec(TEnvironment env) throws ProcedureSuspendedException {
+    // no-op
+  }
+
+  /**
+   * Called after we call the execute method of this procedure, and also after we initialize all the
+   * sub procedures and persist the the state if persistence is needed.
+   * <p>
+   * This is for doing some hooks after we initialize the sub procedures. See HBASE-29259 for more
+   * details on why we can not release the region lock inside the execute method.
+   */
+  protected void afterExec(TEnvironment env) {
     // no-op
   }
 
@@ -904,7 +925,7 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure<TE
     this.wasExecuted = true;
   }
 
-  protected synchronized boolean wasExecuted() {
+  public synchronized boolean wasExecuted() {
     return wasExecuted;
   }
 
@@ -1032,6 +1053,19 @@ public abstract class Procedure<TEnvironment> implements Comparable<Procedure<TE
       store.update(this);
     }
     releaseLock(env);
+  }
+
+  protected final ProcedureSuspendedException suspend(int timeoutMillis, boolean jitter)
+    throws ProcedureSuspendedException {
+    if (jitter) {
+      // 10% possible jitter
+      double add = (double) timeoutMillis * ThreadLocalRandom.current().nextDouble(0.1);
+      timeoutMillis += add;
+    }
+    setTimeout(timeoutMillis);
+    setState(ProcedureProtos.ProcedureState.WAITING_TIMEOUT);
+    skipPersistence();
+    throw new ProcedureSuspendedException();
   }
 
   @Override

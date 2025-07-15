@@ -56,6 +56,7 @@ import org.apache.hadoop.hbase.http.conf.ConfServlet;
 import org.apache.hadoop.hbase.http.log.LogLevel;
 import org.apache.hadoop.hbase.util.ReflectionUtils;
 import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.security.AuthenticationFilterInitializer;
 import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.authentication.server.AuthenticationFilter;
@@ -147,8 +148,14 @@ public class HttpServer implements FilterContainer {
     HTTP_SPNEGO_AUTHENTICATION_PREFIX + "admin.users";
   public static final String HTTP_SPNEGO_AUTHENTICATION_ADMIN_GROUPS_KEY =
     HTTP_SPNEGO_AUTHENTICATION_PREFIX + "admin.groups";
+
+  static final String HTTP_LDAP_AUTHENTICATION_PREFIX = HTTP_AUTHENTICATION_PREFIX + "ldap.";
+  public static final String HTTP_LDAP_AUTHENTICATION_ADMIN_USERS_KEY =
+    HTTP_LDAP_AUTHENTICATION_PREFIX + "admin.users";
+
   public static final String HTTP_PRIVILEGED_CONF_KEY =
     "hbase.security.authentication.ui.config.protected";
+  public static final String HTTP_UI_NO_CACHE_ENABLE_KEY = "hbase.http.filter.no-store.enable";
   public static final boolean HTTP_PRIVILEGED_CONF_DEFAULT = false;
 
   // The ServletContext attribute where the daemon Configuration
@@ -169,7 +176,9 @@ public class HttpServer implements FilterContainer {
       .put("jmx",
         new ServletConfig("jmx", "/jmx", "org.apache.hadoop.hbase.http.jmx.JMXJsonServlet"))
       .put("metrics",
-        new ServletConfig("metrics", "/metrics", "org.apache.hadoop.metrics.MetricsServlet"))
+        // MetricsServlet is deprecated in hadoop 2.8 and removed in 3.0. We shouldn't expect it,
+        // so pass false so that we don't create a noisy warn during instantiation.
+        new ServletConfig("metrics", "/metrics", "org.apache.hadoop.metrics.MetricsServlet", false))
       .put("prometheus", new ServletConfig("prometheus", "/prometheus",
         "org.apache.hadoop.hbase.http.prometheus.PrometheusHadoopServlet"))
       .build();
@@ -688,7 +697,7 @@ public class HttpServer implements FilterContainer {
     ctx.getServletContext().setAttribute(org.apache.hadoop.http.HttpServer2.CONF_CONTEXT_ATTRIBUTE,
       conf);
     ctx.getServletContext().setAttribute(ADMINS_ACL, adminsAcl);
-    addNoCacheFilter(ctx);
+    addNoCacheFilter(ctx, conf);
     return ctx;
   }
 
@@ -710,9 +719,16 @@ public class HttpServer implements FilterContainer {
     return gzipHandler;
   }
 
-  private static void addNoCacheFilter(WebAppContext ctxt) {
-    defineFilter(ctxt, NO_CACHE_FILTER, NoCacheFilter.class.getName(),
-      Collections.<String, String> emptyMap(), new String[] { "/*" });
+  private static void addNoCacheFilter(ServletContextHandler ctxt, Configuration conf) {
+    if (conf.getBoolean(HTTP_UI_NO_CACHE_ENABLE_KEY, false)) {
+      Map<String, String> filterConfig =
+        AuthenticationFilterInitializer.getFilterConfigMap(conf, "hbase.http.filter.");
+      defineFilter(ctxt, NO_CACHE_FILTER, NoCacheFilter.class.getName(), filterConfig,
+        new String[] { "/*" });
+    } else {
+      defineFilter(ctxt, NO_CACHE_FILTER, NoCacheFilter.class.getName(),
+        Collections.<String, String> emptyMap(), new String[] { "/*" });
+    }
   }
 
   /** Get an array of FilterConfiguration specified in the conf */
@@ -753,6 +769,7 @@ public class HttpServer implements FilterContainer {
         conf.getBoolean(ServerConfigurationKeys.HBASE_JETTY_LOGS_SERVE_ALIASES,
           ServerConfigurationKeys.DEFAULT_HBASE_JETTY_LOGS_SERVE_ALIASES));
       setContextAttributes(logContext, conf);
+      addNoCacheFilter(logContext, conf);
       defaultContexts.put(logContext, true);
     }
     // set up the context for "/static/*"
@@ -836,16 +853,19 @@ public class HttpServer implements FilterContainer {
     /* register metrics servlets */
     String[] enabledServlets = conf.getStrings(METRIC_SERVLETS_CONF_KEY, METRICS_SERVLETS_DEFAULT);
     for (String enabledServlet : enabledServlets) {
-      try {
-        ServletConfig servletConfig = METRIC_SERVLETS.get(enabledServlet);
-        if (servletConfig != null) {
+      ServletConfig servletConfig = METRIC_SERVLETS.get(enabledServlet);
+      if (servletConfig != null) {
+        try {
           Class<?> clz = Class.forName(servletConfig.getClazz());
           addPrivilegedServlet(servletConfig.getName(), servletConfig.getPathSpec(),
             clz.asSubclass(HttpServlet.class));
+        } catch (Exception e) {
+          if (servletConfig.isExpected()) {
+            // metrics are not critical to read/write, so an exception here shouldn't be fatal
+            // if the class was expected we should warn though
+            LOG.warn("Couldn't register the servlet " + enabledServlet, e);
+          }
         }
-      } catch (Exception e) {
-        /* shouldn't be fatal, so warn the user about it */
-        LOG.warn("Couldn't register the servlet " + enabledServlet, e);
       }
     }
   }

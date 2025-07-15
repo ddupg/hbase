@@ -29,6 +29,7 @@ import "RPC.proto";
 import "Snapshot.proto";
 import "Replication.proto";
 import "RegionServerStatus.proto";
+import "ErrorHandling.proto";
 
 // ============================================================================
 //  WARNING - Compatibility rules
@@ -56,6 +57,7 @@ enum CreateTableState {
   CREATE_TABLE_ASSIGN_REGIONS = 4;
   CREATE_TABLE_UPDATE_DESC_CACHE = 5;
   CREATE_TABLE_POST_OPERATION = 6;
+  CREATE_TABLE_SET_ERASURE_CODING_POLICY = 7;
 }
 
 message CreateTableStateData {
@@ -74,6 +76,7 @@ enum ModifyTableState {
   MODIFY_TABLE_REOPEN_ALL_REGIONS = 7;
   MODIFY_TABLE_CLOSE_EXCESS_REPLICAS = 8;
   MODIFY_TABLE_ASSIGN_NEW_REPLICAS = 9;
+  MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY = 10;
 }
 
 message ModifyTableStateData {
@@ -252,6 +255,8 @@ message SnapshotVerifyProcedureStateData {
   required SnapshotDescription snapshot = 1;
   required RegionInfo region = 2;
   optional ServerName target_server = 3;
+  optional ServerRemoteProcedureState state = 4;
+  optional ForeignExceptionMessage error = 5;
 }
 
 message SnapshotVerifyParameter {
@@ -267,6 +272,7 @@ enum CloneSnapshotState {
   CLONE_SNAPSHOT_UPDATE_DESC_CACHE = 5;
   CLONE_SNAPSHOT_POST_OPERATION = 6;
   CLONE_SNAPHOST_RESTORE_ACL = 7;
+  CLONE_SNAPSHOT_SET_ERASURE_CODING_POLICY = 8;
 }
 
 message CloneSnapshotStateData {
@@ -285,6 +291,7 @@ enum RestoreSnapshotState {
   RESTORE_SNAPSHOT_WRITE_FS_LAYOUT = 3;
   RESTORE_SNAPSHOT_UPDATE_META = 4;
   RESTORE_SNAPSHOT_RESTORE_ACL = 5;
+  RESTORE_SNAPSHOT_SYNC_ERASURE_CODING_POLICY = 6;
 }
 
 message RestoreSnapshotStateData {
@@ -296,6 +303,7 @@ message RestoreSnapshotStateData {
   repeated RegionInfo region_info_for_add = 6;
   repeated RestoreParentToChildRegionsPair parent_to_child_regions_pair_list = 7;
   optional bool restore_acl = 8;
+  required TableSchema old_table_schema = 9;
 }
 
 enum DispatchMergingRegionsState {
@@ -498,6 +506,8 @@ message RefreshPeerStateData {
   required string peer_id = 1;
   required PeerModificationType type = 2;
   required ServerName target_server = 3;
+  optional ServerRemoteProcedureState state = 5;
+  optional ForeignExceptionMessage error = 6;
 }
 
 message RefreshPeerParameter {
@@ -581,6 +591,14 @@ enum RegionRemoteProcedureBaseState {
   REGION_REMOTE_PROCEDURE_SERVER_CRASH = 4;
 }
 
+enum ServerRemoteProcedureState {
+  SERVER_REMOTE_PROCEDURE_DISPATCH = 1;
+  SERVER_REMOTE_PROCEDURE_DISPATCH_FAIL = 2;
+  SERVER_REMOTE_PROCEDURE_REPORT_SUCCEED = 3;
+  SERVER_REMOTE_PROCEDURE_REPORT_FAILED = 4;
+  SERVER_REMOTE_PROCEDURE_SERVER_CRASH = 5;
+}
+
 message RegionRemoteProcedureBaseStateData {
   required RegionInfo region = 1;
   required ServerName target_server = 2;
@@ -612,6 +630,8 @@ message SwitchRpcThrottleStateData {
 message SwitchRpcThrottleRemoteStateData {
   required ServerName target_server = 1;
   required bool rpc_throttle_enabled = 2;
+  optional ServerRemoteProcedureState state = 3;
+  optional ForeignExceptionMessage error = 4;
 }
 
 message SplitWALParameter {
@@ -629,6 +649,8 @@ message SplitWALRemoteData {
   required string wal_path = 1;
   required ServerName crashed_server = 2;
   required ServerName worker = 3;
+  optional ServerRemoteProcedureState state = 4;
+  optional ForeignExceptionMessage error = 5;
 }
 
 enum SplitWALState {
@@ -645,6 +667,8 @@ message ClaimReplicationQueueRemoteStateData {
   required ServerName crashed_server = 1;
   required string queue = 2;
   required ServerName target_server = 3;
+  optional ServerRemoteProcedureState state = 5;
+  optional ForeignExceptionMessage error = 6;
 }
 
 message ClaimReplicationQueueRemoteParameter {
@@ -681,4 +705,28 @@ message ModifyStoreFileTrackerStateData {
 
 message ModifyColumnFamilyStoreFileTrackerStateData {
   required bytes family = 1;
+}
+
+enum CloseExcessRegionReplicasProcedureState {
+  CLOSE_EXCESS_REGION_REPLICAS_SCHEDULE = 1;
+  CLOSE_EXCESS_REGION_REPLICAS_CONFIRM = 2;
+}
+
+message CloseExcessRegionReplicasProcedureStateData {
+  required TableName table_name = 1;
+  required uint32 new_replica_count = 2;
+}
+
+enum CloseTableRegionsProcedureState {
+  CLOSE_TABLE_REGIONS_SCHEDULE = 1;
+  CLOSE_TABLE_REGIONS_CONFIRM = 2;
+}
+
+message CloseTableRegionsProcedureStateData {
+  required TableName table_name = 1;
+}
+
+message ReloadQuotasProcedureStateData {
+  required ServerName target_server = 1;
+  optional ForeignExceptionMessage error = 2;
 }

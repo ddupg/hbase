@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Optional;
 import org.apache.commons.lang3.mutable.Mutable;
 import org.apache.commons.lang3.mutable.MutableBoolean;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.io.HeapSize;
 import org.apache.hadoop.hbase.io.hfile.bucket.BucketCache;
@@ -109,8 +110,6 @@ public class CombinedBlockCache implements ResizableBlockCache, HeapSize {
         }
       } else {
         if (existInL1) {
-          LOG.warn("Cache key {} had block type {}, but was found in L1 cache.", cacheKey,
-            cacheKey.getBlockType());
           updateBlockMetrics(block, cacheKey, l1Cache, caching);
         } else {
           updateBlockMetrics(block, cacheKey, l2Cache, caching);
@@ -463,6 +462,12 @@ public class CombinedBlockCache implements ResizableBlockCache, HeapSize {
   }
 
   @Override
+  public void onConfigurationChange(Configuration config) {
+    l1Cache.onConfigurationChange(config);
+    l2Cache.onConfigurationChange(config);
+  }
+
+  @Override
   public Optional<Boolean> blockFitsIntoTheCache(HFileBlock block) {
     if (isMetaBlock(block.getBlockType())) {
       return l1Cache.blockFitsIntoTheCache(block);
@@ -494,4 +499,20 @@ public class CombinedBlockCache implements ResizableBlockCache, HeapSize {
     return l1Result.isPresent() ? l1Result : l2Cache.getBlockSize(key);
   }
 
+  @Override
+  public int evictBlocksRangeByHfileName(String hfileName, long initOffset, long endOffset) {
+    return l1Cache.evictBlocksRangeByHfileName(hfileName, initOffset, endOffset)
+      + l2Cache.evictBlocksRangeByHfileName(hfileName, initOffset, endOffset);
+  }
+
+  @Override
+  public boolean waitForCacheInitialization(long timeout) {
+    return this.l1Cache.waitForCacheInitialization(timeout)
+      && this.l2Cache.waitForCacheInitialization(timeout);
+  }
+
+  @Override
+  public boolean isCacheEnabled() {
+    return l1Cache.isCacheEnabled() && l2Cache.isCacheEnabled();
+  }
 }

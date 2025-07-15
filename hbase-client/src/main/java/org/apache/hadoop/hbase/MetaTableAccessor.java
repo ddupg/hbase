@@ -1309,7 +1309,16 @@ public class MetaTableAccessor {
    * @throws IllegalArgumentException when the provided RegionInfo is not the default replica.
    */
   public static Put makePutFromRegionInfo(RegionInfo regionInfo, long ts) throws IOException {
-    return addRegionInfo(new Put(getMetaKeyForRegion(regionInfo), ts), regionInfo);
+    byte[] metaKeyForRegion = getMetaKeyForRegion(regionInfo);
+    try {
+      Put put = new Put(metaKeyForRegion, ts);
+      return addRegionInfo(put, regionInfo);
+    } catch (IllegalArgumentException ex) {
+      LOG.error(
+        "Got exception while creating put for regioninfo {}." + "meta key for regioninfo is {}",
+        regionInfo.getRegionNameAsString(), metaKeyForRegion);
+      throw ex;
+    }
   }
 
   /**
@@ -1547,7 +1556,7 @@ public class MetaTableAccessor {
   public static void mergeRegions(Connection connection, RegionInfo mergedRegion,
     Map<RegionInfo, Long> parentSeqNum, ServerName sn, int regionReplication) throws IOException {
     try (Table meta = getMetaHTable(connection)) {
-      long time = HConstants.LATEST_TIMESTAMP;
+      long time = EnvironmentEdgeManager.currentTime();
       List<Mutation> mutations = new ArrayList<>();
       List<RegionInfo> replicationParents = new ArrayList<>();
       for (Map.Entry<RegionInfo, Long> e : parentSeqNum.entrySet()) {

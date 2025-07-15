@@ -38,7 +38,6 @@
         <include>org.apache.hbase:hbase-client</include>
         <include>org.apache.hbase:hbase-common</include>
         <include>org.apache.hbase:hbase-endpoint</include>
-        <include>org.apache.hbase:hbase-examples</include>
         <include>org.apache.hbase:hbase-external-blockcache</include>
         <include>org.apache.hbase:hbase-hadoop-compat</include>
         <include>org.apache.hbase:hbase-hadoop2-compat</include>
@@ -86,11 +85,6 @@
               <exclude>org.glassfish.ha:ha-api</exclude>
               <exclude>com.sun.xml.messaging.saaj:saaj-impl</exclude>
               <exclude>jakarta.activation:jakarta.activation-api</exclude>
-              <exclude>com.sun.xml.bind:jaxb-xjc</exclude>
-              <exclude>com.sun.xml.bind:jaxb-jxc</exclude>
-              <exclude>jakarta.mail:jakarta.mail-api</exclude>
-              <exclude>jakarta.persistence:jakarta.persistence-api</exclude>
-              <exclude>org.eclipse.persistence:*</exclude>
               <exclude>jakarta.xml.ws:jakarta.xml.ws-api</exclude>
               <exclude>jakarta.xml.bind:jakarta.xml.bind-api</exclude>
               <exclude>jakarta.xml.soap:jakarta.xml.soap-api</exclude>
@@ -114,6 +108,11 @@
               <exclude>junit:junit</exclude>
               <exclude>org.hamcrest:hamcrest-core</exclude>
               <exclude>org.mockito:mockito-core</exclude>
+              <!-- Exclude transitive dependencies of tomcat-jasper, not needed at runtime -->
+              <exclude>org.apache.tomcat:tomcat-juli</exclude>
+              <exclude>org.apache.tomcat:tomcat-api</exclude>
+              <exclude>org.apache.tomcat:tomcat-util-scan</exclude>
+              <exclude>org.apache.tomcat:tomcat-util</exclude>
             </excludes>
           </dependencySet>
         </dependencySets>
@@ -212,6 +211,7 @@
         <include>org.slf4j:*</include>
         <include>org.apache.logging.log4j:*</include>
         <include>io.opentelemetry:*</include>
+        <include>io.opentelemetry.semconv:*</include>
       </includes>
     </dependencySet>
     <dependencySet>
@@ -224,8 +224,8 @@
       <outputDirectory>lib/jdk11</outputDirectory>
       <useTransitiveDependencies>true</useTransitiveDependencies>
       <includes>
-          <include>com.sun.activation:javax.activation</include>
-        <!-- The following artifacts are transitive dependencies of com.sun.xml.ws:jaxws-ri:pom
+        <include>com.sun.activation:javax.activation</include>
+        <!-- The following artifacts are transitive dependencies of com.sun.xml.ws:jaxws-rt:pom
              They are needed to be included in lib/jdk11 to be added to classpath during
              Java 11 runtime
         -->
@@ -245,16 +245,15 @@
         <include>com.fasterxml.woodstox:woodstox-core</include>
         <include>org.codehaus.woodstox:stax2-api</include>
         <include>jakarta.activation:jakarta.activation-api</include>
-        <include>com.sun.xml.bind:jaxb-xjc</include>
-        <include>com.sun.xml.bind:jaxb-jxc</include>
-        <include>jakarta.mail:jakarta.mail-api</include>
-        <include>jakarta.persistence:jakarta.persistence-api</include>
-        <include>org.eclipse.persistence:*</include>
         <include>jakarta.xml.ws:jakarta.xml.ws-api</include>
         <include>jakarta.xml.bind:jakarta.xml.bind-api</include>
         <include>jakarta.xml.soap:jakarta.xml.soap-api</include>
         <include>jakarta.jws:jakarta.jws-api</include>
       </includes>
+      <excludes>
+        <!-- Exclude pom file -->
+        <exclude>com.sun.xml.ws:jaxws-rt:pom</exclude>
+      </excludes>
     </dependencySet>
     <dependencySet>
       <outputDirectory>lib/trace</outputDirectory>

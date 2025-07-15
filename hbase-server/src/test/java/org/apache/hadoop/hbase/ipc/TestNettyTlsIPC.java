@@ -30,6 +30,7 @@ import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
 import org.apache.hadoop.hbase.HBaseCommonTestingUtility;
+import org.apache.hadoop.hbase.Server;
 import org.apache.hadoop.hbase.codec.Codec;
 import org.apache.hadoop.hbase.io.crypto.tls.KeyStoreFileType;
 import org.apache.hadoop.hbase.io.crypto.tls.X509KeyType;
@@ -66,39 +67,41 @@ public class TestNettyTlsIPC extends AbstractTestIPC {
 
   private static NettyEventLoopGroupConfig EVENT_LOOP_GROUP_CONFIG;
 
-  private static HRegionServer SERVER;
-
-  @Parameterized.Parameter(0)
+  @Parameterized.Parameter(1)
   public X509KeyType caKeyType;
 
-  @Parameterized.Parameter(1)
+  @Parameterized.Parameter(2)
   public X509KeyType certKeyType;
 
-  @Parameterized.Parameter(2)
+  @Parameterized.Parameter(3)
   public char[] keyPassword;
 
-  @Parameterized.Parameter(3)
+  @Parameterized.Parameter(4)
   public boolean acceptPlainText;
 
-  @Parameterized.Parameter(4)
+  @Parameterized.Parameter(5)
   public boolean clientTlsEnabled;
 
   private X509TestContext x509TestContext;
 
+  // only netty rpc server supports TLS, so here we will only test NettyRpcServer
   @Parameterized.Parameters(
-      name = "{index}: caKeyType={0}, certKeyType={1}, keyPassword={2}, acceptPlainText={3},"
-        + " clientTlsEnabled={4}")
+      name = "{index}: rpcServerImpl={0}, caKeyType={1}, certKeyType={2}, keyPassword={3},"
+        + " acceptPlainText={4}, clientTlsEnabled={5}")
   public static List<Object[]> data() {
     List<Object[]> params = new ArrayList<>();
     for (X509KeyType caKeyType : X509KeyType.values()) {
       for (X509KeyType certKeyType : X509KeyType.values()) {
         for (char[] keyPassword : new char[][] { "".toCharArray(), "pa$$w0rd".toCharArray() }) {
           // do not accept plain text
-          params.add(new Object[] { caKeyType, certKeyType, keyPassword, false, true });
+          params.add(new Object[] { NettyRpcServer.class, caKeyType, certKeyType, keyPassword,
+            false, true });
           // support plain text and client enables tls
-          params.add(new Object[] { caKeyType, certKeyType, keyPassword, true, true });
+          params.add(
+            new Object[] { NettyRpcServer.class, caKeyType, certKeyType, keyPassword, true, true });
           // support plain text and client disables tls
-          params.add(new Object[] { caKeyType, certKeyType, keyPassword, true, false });
+          params.add(new Object[] { NettyRpcServer.class, caKeyType, certKeyType, keyPassword, true,
+            false });
         }
       }
     }
@@ -120,8 +123,6 @@ public class TestNettyTlsIPC extends AbstractTestIPC {
       EVENT_LOOP_GROUP_CONFIG.clientChannelClass());
     NettyAsyncFSWALConfigHelper.setEventLoopConfig(CONF, EVENT_LOOP_GROUP_CONFIG.group(),
       EVENT_LOOP_GROUP_CONFIG.clientChannelClass());
-    SERVER = mock(HRegionServer.class);
-    when(SERVER.getEventLoopGroupConfig()).thenReturn(EVENT_LOOP_GROUP_CONFIG);
   }
 
   @AfterClass
@@ -152,9 +153,16 @@ public class TestNettyTlsIPC extends AbstractTestIPC {
   }
 
   @Override
-  protected RpcServer createRpcServer(String name, List<BlockingServiceAndInterface> services,
-    InetSocketAddress bindAddress, Configuration conf, RpcScheduler scheduler) throws IOException {
-    return new NettyRpcServer(SERVER, name, services, bindAddress, conf, scheduler, true);
+  protected RpcServer createRpcServer(Server server, String name,
+    List<BlockingServiceAndInterface> services, InetSocketAddress bindAddress, Configuration conf,
+    RpcScheduler scheduler) throws IOException {
+    HRegionServer mockServer = mock(HRegionServer.class);
+    when(mockServer.getEventLoopGroupConfig()).thenReturn(EVENT_LOOP_GROUP_CONFIG);
+    if (server instanceof HRegionServer) {
+      String clusterId = ((HRegionServer) server).getClusterId();
+      when(mockServer.getClusterId()).thenReturn(clusterId);
+    }
+    return new NettyRpcServer(mockServer, name, services, bindAddress, conf, scheduler, true);
   }
 
   @Override
@@ -189,7 +197,9 @@ public class TestNettyTlsIPC extends AbstractTestIPC {
   protected RpcServer createTestFailingRpcServer(String name,
     List<BlockingServiceAndInterface> services, InetSocketAddress bindAddress, Configuration conf,
     RpcScheduler scheduler) throws IOException {
-    return new FailingNettyRpcServer(SERVER, name, services, bindAddress, conf, scheduler);
+    HRegionServer mockServer = mock(HRegionServer.class);
+    when(mockServer.getEventLoopGroupConfig()).thenReturn(EVENT_LOOP_GROUP_CONFIG);
+    return new FailingNettyRpcServer(mockServer, name, services, bindAddress, conf, scheduler);
   }
 
   @Override

@@ -88,6 +88,7 @@ import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.OnlineLogRecord;
 import org.apache.hadoop.hbase.client.PackagePrivateFieldAccessor;
 import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.client.QueryMetrics;
 import org.apache.hadoop.hbase.client.RegionInfoBuilder;
 import org.apache.hadoop.hbase.client.RegionLoadStats;
 import org.apache.hadoop.hbase.client.RegionReplicaUtil;
@@ -611,6 +612,7 @@ public final class ProtobufUtil {
     if (proto.hasLoadColumnFamiliesOnDemand()) {
       get.setLoadColumnFamiliesOnDemand(proto.getLoadColumnFamiliesOnDemand());
     }
+    get.setQueryMetricsEnabled(proto.getQueryMetricsEnabled());
     return get;
   }
 
@@ -1051,6 +1053,7 @@ public final class ProtobufUtil {
     if (scan.isNeedCursorResult()) {
       scanBuilder.setNeedCursorResult(true);
     }
+    scanBuilder.setQueryMetricsEnabled(scan.isQueryMetricsEnabled());
     return scanBuilder.build();
   }
 
@@ -1160,6 +1163,7 @@ public final class ProtobufUtil {
     if (proto.getNeedCursorResult()) {
       scan.setNeedCursorResult(true);
     }
+    scan.setQueryMetricsEnabled(proto.getQueryMetricsEnabled());
     return scan;
   }
 
@@ -1239,6 +1243,7 @@ public final class ProtobufUtil {
     if (loadColumnFamiliesOnDemand != null) {
       builder.setLoadColumnFamiliesOnDemand(loadColumnFamiliesOnDemand);
     }
+    builder.setQueryMetricsEnabled(get.isQueryMetricsEnabled());
     return builder.build();
   }
 
@@ -1393,6 +1398,10 @@ public final class ProtobufUtil {
     builder.setStale(result.isStale());
     builder.setPartial(result.mayHaveMoreCellsInRow());
 
+    if (result.getMetrics() != null) {
+      builder.setMetrics(toQueryMetrics(result.getMetrics()));
+    }
+
     return builder.build();
   }
 
@@ -1422,6 +1431,9 @@ public final class ProtobufUtil {
     ClientProtos.Result.Builder builder = ClientProtos.Result.newBuilder();
     builder.setAssociatedCellCount(size);
     builder.setStale(result.isStale());
+    if (result.getMetrics() != null) {
+      builder.setMetrics(toQueryMetrics(result.getMetrics()));
+    }
     return builder.build();
   }
 
@@ -1462,7 +1474,11 @@ public final class ProtobufUtil {
     for (CellProtos.Cell c : values) {
       cells.add(toCell(builder, c, decodeTags));
     }
-    return Result.create(cells, null, proto.getStale(), proto.getPartial());
+    Result r = Result.create(cells, null, proto.getStale(), proto.getPartial());
+    if (proto.hasMetrics()) {
+      r.setMetrics(toQueryMetrics(proto.getMetrics()));
+    }
+    return r;
   }
 
   /**
@@ -1507,9 +1523,15 @@ public final class ProtobufUtil {
       }
     }
 
-    return (cells == null || cells.isEmpty())
+    Result r = (cells == null || cells.isEmpty())
       ? (proto.getStale() ? EMPTY_RESULT_STALE : EMPTY_RESULT)
       : Result.create(cells, null, proto.getStale());
+
+    if (proto.hasMetrics()) {
+      r.setMetrics(toQueryMetrics(proto.getMetrics()));
+    }
+
+    return r;
   }
 
   /**
@@ -2115,7 +2137,9 @@ public final class ProtobufUtil {
    * @return toString of passed <code>m</code>
    */
   public static String getShortTextFormat(Message m) {
-    if (m == null) return "null";
+    if (m == null) {
+      return "null";
+    }
     if (m instanceof ScanRequest) {
       // This should be small and safe to output. No data.
       return TextFormat.shortDebugString(m);
@@ -2157,6 +2181,8 @@ public final class ProtobufUtil {
       ClientProtos.CoprocessorServiceRequest r = (ClientProtos.CoprocessorServiceRequest) m;
       return "coprocessorService= " + r.getCall().getServiceName() + ":"
         + r.getCall().getMethodName();
+    } else if (m instanceof MasterProtos.MoveRegionRequest) {
+      return TextFormat.shortDebugString(m);
     }
     return "TODO: " + m.getClass().toString();
   }
@@ -2429,6 +2455,14 @@ public final class ProtobufUtil {
         return ThrottleType.READ_CAPACITY_UNIT;
       case WRITE_CAPACITY_UNIT:
         return ThrottleType.WRITE_CAPACITY_UNIT;
+      case ATOMIC_READ_SIZE:
+        return ThrottleType.ATOMIC_READ_SIZE;
+      case ATOMIC_REQUEST_NUMBER:
+        return ThrottleType.ATOMIC_REQUEST_NUMBER;
+      case ATOMIC_WRITE_SIZE:
+        return ThrottleType.ATOMIC_WRITE_SIZE;
+      case REQUEST_HANDLER_USAGE_MS:
+        return ThrottleType.REQUEST_HANDLER_USAGE_MS;
       default:
         throw new RuntimeException("Invalid ThrottleType " + proto);
     }
@@ -2458,6 +2492,14 @@ public final class ProtobufUtil {
         return QuotaProtos.ThrottleType.READ_CAPACITY_UNIT;
       case WRITE_CAPACITY_UNIT:
         return QuotaProtos.ThrottleType.WRITE_CAPACITY_UNIT;
+      case ATOMIC_READ_SIZE:
+        return QuotaProtos.ThrottleType.ATOMIC_READ_SIZE;
+      case ATOMIC_REQUEST_NUMBER:
+        return QuotaProtos.ThrottleType.ATOMIC_REQUEST_NUMBER;
+      case ATOMIC_WRITE_SIZE:
+        return QuotaProtos.ThrottleType.ATOMIC_WRITE_SIZE;
+      case REQUEST_HANDLER_USAGE_MS:
+        return QuotaProtos.ThrottleType.REQUEST_HANDLER_USAGE_MS;
       default:
         throw new RuntimeException("Invalid ThrottleType " + type);
     }
@@ -3054,10 +3096,12 @@ public final class ProtobufUtil {
   }
 
   public static CloseRegionRequest buildCloseRegionRequest(ServerName server, byte[] regionName,
-    ServerName destinationServer, long closeProcId, boolean evictCache) {
+    ServerName destinationServer, long closeProcId, boolean evictCache,
+    long initiatingMasterActiveTime) {
     CloseRegionRequest.Builder builder =
       getBuilder(server, regionName, destinationServer, closeProcId);
     builder.setEvictCache(evictCache);
+    builder.setInitiatingMasterActiveTime(initiatingMasterActiveTime);
     return builder.build();
   }
 
@@ -3140,7 +3184,7 @@ public final class ProtobufUtil {
       int prefixLen = ProtobufMagic.lengthOfPBMagic();
       try {
         ZooKeeperProtos.Master rss =
-          ZooKeeperProtos.Master.PARSER.parseFrom(data, prefixLen, data.length - prefixLen);
+          ZooKeeperProtos.Master.parser().parseFrom(data, prefixLen, data.length - prefixLen);
         org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.ServerName sn =
           rss.getMaster();
         return ServerName.valueOf(sn.getHostName(), sn.getPort(), sn.getStartCode());
@@ -3421,6 +3465,7 @@ public final class ProtobufUtil {
         .setQueueTime(slowLogPayload.getQueueTime()).setRegionName(slowLogPayload.getRegionName())
         .setResponseSize(slowLogPayload.getResponseSize())
         .setBlockBytesScanned(slowLogPayload.getBlockBytesScanned())
+        .setFsReadTime(slowLogPayload.getFsReadTime())
         .setServerClass(slowLogPayload.getServerClass()).setStartTime(slowLogPayload.getStartTime())
         .setUserName(slowLogPayload.getUserName())
         .setRequestAttributes(convertNameBytesPairsToMap(slowLogPayload.getRequestAttributeList()))
@@ -3490,6 +3535,7 @@ public final class ProtobufUtil {
       ? ProtobufUtil.toTimeRange(condition.getTimeRange())
       : TimeRange.allTime();
     builder.timeRange(timeRange);
+    builder.queryMetricsEnabled(condition.getQueryMetricsEnabled());
 
     try {
       MutationType type = mutation.getMutateType();
@@ -3527,6 +3573,7 @@ public final class ProtobufUtil {
       ? ProtobufUtil.toTimeRange(condition.getTimeRange())
       : TimeRange.allTime();
     builder.timeRange(timeRange);
+    builder.queryMetricsEnabled(condition.getQueryMetricsEnabled());
 
     try {
       if (mutations.size() == 1) {
@@ -3553,7 +3600,7 @@ public final class ProtobufUtil {
 
   public static ClientProtos.Condition toCondition(final byte[] row, final byte[] family,
     final byte[] qualifier, final CompareOperator op, final byte[] value, final Filter filter,
-    final TimeRange timeRange) throws IOException {
+    final TimeRange timeRange, boolean queryMetricsEnabled) throws IOException {
 
     ClientProtos.Condition.Builder builder =
       ClientProtos.Condition.newBuilder().setRow(UnsafeByteOperations.unsafeWrap(row));
@@ -3568,18 +3615,19 @@ public final class ProtobufUtil {
         .setCompareType(HBaseProtos.CompareType.valueOf(op.name()));
     }
 
+    builder.setQueryMetricsEnabled(queryMetricsEnabled);
     return builder.setTimeRange(ProtobufUtil.toTimeRange(timeRange)).build();
   }
 
   public static ClientProtos.Condition toCondition(final byte[] row, final Filter filter,
     final TimeRange timeRange) throws IOException {
-    return toCondition(row, null, null, null, null, filter, timeRange);
+    return toCondition(row, null, null, null, null, filter, timeRange, false);
   }
 
   public static ClientProtos.Condition toCondition(final byte[] row, final byte[] family,
     final byte[] qualifier, final CompareOperator op, final byte[] value, final TimeRange timeRange)
     throws IOException {
-    return toCondition(row, family, qualifier, op, value, null, timeRange);
+    return toCondition(row, family, qualifier, op, value, null, timeRange, false);
   }
 
   public static List<LogEntry> toBalancerDecisionResponse(HBaseProtos.LogEntry logEntry) {
@@ -3696,6 +3744,15 @@ public final class ProtobufUtil {
       .setStatus(task.getStatus())
       .setState(ClusterStatusProtos.ServerTask.State.valueOf(task.getState().name()))
       .setStartTime(task.getStartTime()).setCompletionTime(task.getCompletionTime()).build();
+  }
+
+  public static ClientProtos.QueryMetrics toQueryMetrics(QueryMetrics metrics) {
+    return ClientProtos.QueryMetrics.newBuilder()
+      .setBlockBytesScanned(metrics.getBlockBytesScanned()).build();
+  }
+
+  public static QueryMetrics toQueryMetrics(ClientProtos.QueryMetrics metrics) {
+    return new QueryMetrics(metrics.getBlockBytesScanned());
   }
 
   /**

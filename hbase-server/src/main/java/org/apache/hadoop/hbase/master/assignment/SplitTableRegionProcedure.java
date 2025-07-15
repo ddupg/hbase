@@ -57,6 +57,7 @@ import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;
 import org.apache.hadoop.hbase.master.procedure.MasterProcedureUtil;
 import org.apache.hadoop.hbase.procedure2.ProcedureMetrics;
 import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;
+import org.apache.hadoop.hbase.quotas.MasterQuotaManager;
 import org.apache.hadoop.hbase.quotas.QuotaExceededException;
 import org.apache.hadoop.hbase.regionserver.HRegionFileSystem;
 import org.apache.hadoop.hbase.regionserver.HStore;
@@ -102,6 +103,8 @@ public class SplitTableRegionProcedure
   private RegionInfo daughterTwoRI;
   private byte[] bestSplitRow;
   private RegionSplitPolicy splitPolicy;
+  // exposed for unit testing
+  boolean checkTableModifyInProgress = true;
 
   public SplitTableRegionProcedure() {
     // Required by the Procedure framework to create the procedure on replay
@@ -392,7 +395,8 @@ public class SplitTableRegionProcedure
           postRollBackSplitRegion(env);
           break;
         case SPLIT_TABLE_REGION_PREPARE:
-          break; // nothing to do
+          rollbackPrepareSplit(env);
+          break;
         default:
           throw new UnsupportedOperationException(this + " unhandled state=" + state);
       }
@@ -512,6 +516,20 @@ public class SplitTableRegionProcedure
         + ", because we are taking snapshot for the table " + getParentRegion().getTable()));
       return false;
     }
+
+    /*
+     * Sometimes a ModifyTableProcedure has edited a table descriptor to change the number of region
+     * replicas for a table, but it has not yet opened/closed the new replicas. The
+     * ModifyTableProcedure assumes that nobody else will do the opening/closing of the new
+     * replicas, but a concurrent SplitTableRegionProcedure would violate that assumption.
+     */
+    if (checkTableModifyInProgress && isTableModificationInProgress(env)) {
+      setFailure(new IOException("Skip splitting region " + getParentRegion().getShortNameToLog()
+        + ", because there is an active procedure that is modifying the table "
+        + getParentRegion().getTable()));
+      return false;
+    }
+
     // Check whether the region is splittable
     RegionStateNode node =
       env.getAssignmentManager().getRegionStates().getRegionStateNode(getParentRegion());
@@ -546,16 +564,18 @@ public class SplitTableRegionProcedure
       return false;
     }
 
-    // Mostly this check is not used because we already check the switch before submit a split
-    // procedure. Just for safe, check the switch again. This procedure can be rollbacked if
-    // the switch was set to false after submit.
+    // Mostly the below two checks are not used because we already check the switches before
+    // submitting the split procedure. Just for safety, we are checking the switch again here.
+    // Also, in case the switch was set to false after submission, this procedure can be rollbacked,
+    // thanks to this double check!
+    // case 1: check for cluster level switch
     if (!env.getMasterServices().isSplitOrMergeEnabled(MasterSwitchType.SPLIT)) {
       LOG.warn("pid=" + getProcId() + " split switch is off! skip split of " + parentHRI);
       setFailure(new IOException(
         "Split region " + parentHRI.getRegionNameAsString() + " failed due to split switch off"));
       return false;
     }
-
+    // case 2: check for table level switch
     if (!env.getMasterServices().getTableDescriptors().get(getTableName()).isSplitEnabled()) {
       LOG.warn("pid={}, split is disabled for the table! Skipping split of {}", getProcId(),
         parentHRI);
@@ -573,6 +593,18 @@ public class SplitTableRegionProcedure
   }
 
   /**
+   * Rollback prepare split region
+   * @param env MasterProcedureEnv
+   */
+  private void rollbackPrepareSplit(final MasterProcedureEnv env) {
+    RegionStateNode parentRegionStateNode =
+      env.getAssignmentManager().getRegionStates().getRegionStateNode(getParentRegion());
+    if (parentRegionStateNode.getState() == State.SPLITTING) {
+      parentRegionStateNode.setState(State.OPEN);
+    }
+  }
+
+  /**
    * Action before splitting region in a table.
    * @param env MasterProcedureEnv
    */
@@ -586,7 +618,10 @@ public class SplitTableRegionProcedure
     // TODO: Clean up split and merge. Currently all over the place.
     // Notify QuotaManager and RegionNormalizer
     try {
-      env.getMasterServices().getMasterQuotaManager().onRegionSplit(this.getParentRegion());
+      MasterQuotaManager masterQuotaManager = env.getMasterServices().getMasterQuotaManager();
+      if (masterQuotaManager != null) {
+        masterQuotaManager.onRegionSplit(this.getParentRegion());
+      }
     } catch (QuotaExceededException e) {
       // TODO: why is this here? split requests can be submitted by actors other than the normalizer
       env.getMasterServices().getRegionNormalizerManager()
@@ -666,8 +701,9 @@ public class SplitTableRegionProcedure
     // table dir. In case of failure, the proc would go through this again, already existing
     // region dirs and split files would just be ignored, new split files should get created.
     int nbFiles = 0;
-    final Map<String, Collection<StoreFileInfo>> files =
-      new HashMap<String, Collection<StoreFileInfo>>(htd.getColumnFamilyCount());
+    final Map<String, Pair<Collection<StoreFileInfo>, StoreFileTracker>> files =
+      new HashMap<String, Pair<Collection<StoreFileInfo>, StoreFileTracker>>(
+        htd.getColumnFamilyCount());
     for (ColumnFamilyDescriptor cfd : htd.getColumnFamilies()) {
       String family = cfd.getNameAsString();
       StoreFileTracker tracker =
@@ -690,7 +726,7 @@ public class SplitTableRegionProcedure
         }
         if (filteredSfis == null) {
           filteredSfis = new ArrayList<StoreFileInfo>(sfis.size());
-          files.put(family, filteredSfis);
+          files.put(family, new Pair(filteredSfis, tracker));
         }
         filteredSfis.add(sfi);
         nbFiles++;
@@ -713,10 +749,12 @@ public class SplitTableRegionProcedure
     final List<Future<Pair<Path, Path>>> futures = new ArrayList<Future<Pair<Path, Path>>>(nbFiles);
 
     // Split each store file.
-    for (Map.Entry<String, Collection<StoreFileInfo>> e : files.entrySet()) {
+    for (Map.Entry<String, Pair<Collection<StoreFileInfo>, StoreFileTracker>> e : files
+      .entrySet()) {
       byte[] familyName = Bytes.toBytes(e.getKey());
       final ColumnFamilyDescriptor hcd = htd.getColumnFamily(familyName);
-      final Collection<StoreFileInfo> storeFiles = e.getValue();
+      Pair<Collection<StoreFileInfo>, StoreFileTracker> storeFilesAndTracker = e.getValue();
+      final Collection<StoreFileInfo> storeFiles = storeFilesAndTracker.getFirst();
       if (storeFiles != null && storeFiles.size() > 0) {
         final Configuration storeConfiguration =
           StoreUtils.createStoreConfiguration(env.getMasterConfiguration(), htd, hcd);
@@ -727,8 +765,9 @@ public class SplitTableRegionProcedure
           // is running in a regionserver's Store context, or we might not be able
           // to read the hfiles.
           storeFileInfo.setConf(storeConfiguration);
-          StoreFileSplitter sfs = new StoreFileSplitter(regionFs, familyName,
-            new HStoreFile(storeFileInfo, hcd.getBloomFilterType(), CacheConfig.DISABLED));
+          StoreFileSplitter sfs =
+            new StoreFileSplitter(regionFs, storeFilesAndTracker.getSecond(), familyName,
+              new HStoreFile(storeFileInfo, hcd.getBloomFilterType(), CacheConfig.DISABLED));
           futures.add(threadPool.submit(sfs));
         }
       }
@@ -794,8 +833,8 @@ public class SplitTableRegionProcedure
     }
   }
 
-  private Pair<Path, Path> splitStoreFile(HRegionFileSystem regionFs, byte[] family, HStoreFile sf)
-    throws IOException {
+  private Pair<Path, Path> splitStoreFile(HRegionFileSystem regionFs, StoreFileTracker tracker,
+    byte[] family, HStoreFile sf) throws IOException {
     if (LOG.isDebugEnabled()) {
       LOG.debug("pid=" + getProcId() + " splitting started for store file: " + sf.getPath()
         + " for region: " + getParentRegion().getShortNameToLog());
@@ -803,10 +842,10 @@ public class SplitTableRegionProcedure
 
     final byte[] splitRow = getSplitRow();
     final String familyName = Bytes.toString(family);
-    final Path path_first =
-      regionFs.splitStoreFile(this.daughterOneRI, familyName, sf, splitRow, false, splitPolicy);
-    final Path path_second =
-      regionFs.splitStoreFile(this.daughterTwoRI, familyName, sf, splitRow, true, splitPolicy);
+    final Path path_first = regionFs.splitStoreFile(this.daughterOneRI, familyName, sf, splitRow,
+      false, splitPolicy, tracker);
+    final Path path_second = regionFs.splitStoreFile(this.daughterTwoRI, familyName, sf, splitRow,
+      true, splitPolicy, tracker);
     if (LOG.isDebugEnabled()) {
       LOG.debug("pid=" + getProcId() + " splitting complete for store file: " + sf.getPath()
         + " for region: " + getParentRegion().getShortNameToLog());
@@ -822,6 +861,7 @@ public class SplitTableRegionProcedure
     private final HRegionFileSystem regionFs;
     private final byte[] family;
     private final HStoreFile sf;
+    private final StoreFileTracker tracker;
 
     /**
      * Constructor that takes what it needs to split
@@ -829,15 +869,17 @@ public class SplitTableRegionProcedure
      * @param family   Family that contains the store file
      * @param sf       which file
      */
-    public StoreFileSplitter(HRegionFileSystem regionFs, byte[] family, HStoreFile sf) {
+    public StoreFileSplitter(HRegionFileSystem regionFs, StoreFileTracker tracker, byte[] family,
+      HStoreFile sf) {
       this.regionFs = regionFs;
       this.sf = sf;
       this.family = family;
+      this.tracker = tracker;
     }
 
     @Override
     public Pair<Path, Path> call() throws IOException {
-      return splitStoreFile(regionFs, family, sf);
+      return splitStoreFile(regionFs, tracker, family, sf);
     }
   }
 

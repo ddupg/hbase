@@ -34,14 +34,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
@@ -76,6 +74,7 @@ import org.apache.hadoop.hbase.client.BufferedMutatorParams;
 import org.apache.hadoop.hbase.client.ClusterConnection;
 import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
+import org.apache.hadoop.hbase.client.ConnectionRegistry;
 import org.apache.hadoop.hbase.client.Hbck;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.RegionLocator;
@@ -111,9 +110,12 @@ import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.JobContext;
 import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.OutputCommitter;
 import org.apache.hadoop.mapreduce.RecordWriter;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.junit.ClassRule;
 import org.junit.Ignore;
@@ -539,23 +541,19 @@ public class TestHFileOutputFormat2 {
   }
 
   private byte[][] generateRandomStartKeys(int numKeys) {
-    Random random = ThreadLocalRandom.current();
     byte[][] ret = new byte[numKeys][];
     // first region start key is always empty
     ret[0] = HConstants.EMPTY_BYTE_ARRAY;
     for (int i = 1; i < numKeys; i++) {
-      ret[i] =
-        PerformanceEvaluation.generateData(random, PerformanceEvaluation.DEFAULT_VALUE_LENGTH);
+      ret[i] = PerformanceEvaluation.generateData(PerformanceEvaluation.DEFAULT_VALUE_LENGTH);
     }
     return ret;
   }
 
   private byte[][] generateRandomSplitKeys(int numKeys) {
-    Random random = ThreadLocalRandom.current();
     byte[][] ret = new byte[numKeys][];
     for (int i = 0; i < numKeys; i++) {
-      ret[i] =
-        PerformanceEvaluation.generateData(random, PerformanceEvaluation.DEFAULT_VALUE_LENGTH);
+      ret[i] = PerformanceEvaluation.generateData(PerformanceEvaluation.DEFAULT_VALUE_LENGTH);
     }
     return ret;
   }
@@ -1598,6 +1596,59 @@ public class TestHFileOutputFormat2 {
     }
   }
 
+  @Test
+  public void itGetsWorkPathHadoop2() throws Exception {
+    Configuration conf = new Configuration(this.util.getConfiguration());
+    Job job = new Job(conf);
+    FileOutputCommitter committer =
+      new FileOutputCommitter(new Path("/test"), createTestTaskAttemptContext(job));
+    assertEquals(committer.getWorkPath(), HFileOutputFormat2.getWorkPath(committer));
+  }
+
+  @Test
+  public void itGetsWorkPathHadoo3() {
+    Hadoop3TestOutputCommitter committer = new Hadoop3TestOutputCommitter(new Path("/test"));
+    assertEquals(committer.getWorkPath(), HFileOutputFormat2.getWorkPath(committer));
+  }
+
+  static class Hadoop3TestOutputCommitter extends OutputCommitter {
+
+    Path path;
+
+    Hadoop3TestOutputCommitter(Path path) {
+      this.path = path;
+    }
+
+    public Path getWorkPath() {
+      return path;
+    }
+
+    @Override
+    public void setupJob(JobContext jobContext) throws IOException {
+
+    }
+
+    @Override
+    public void setupTask(TaskAttemptContext taskAttemptContext) throws IOException {
+
+    }
+
+    @Override
+    public boolean needsTaskCommit(TaskAttemptContext taskAttemptContext) throws IOException {
+      return false;
+    }
+
+    @Override
+    public void commitTask(TaskAttemptContext taskAttemptContext) throws IOException {
+
+    }
+
+    @Override
+    public void abortTask(TaskAttemptContext taskAttemptContext) throws IOException {
+
+    }
+  }
+
   private static class ConfigurationCaptorConnection implements Connection {
     private static final String UUID_KEY = "ConfigurationCaptorConnection.uuid";
 
@@ -1606,7 +1657,9 @@ public class TestHFileOutputFormat2 {
     private final Connection delegate;
 
     public ConfigurationCaptorConnection(Configuration conf, ExecutorService es, User user,
-      Map<String, byte[]> connectionAttributes) throws IOException {
+      ConnectionRegistry registry, Map<String, byte[]> connectionAttributes) throws IOException {
+      // here we do not use this registry, so close it...
+      registry.close();
       Configuration confForDelegate = new Configuration(conf);
       confForDelegate.unset(ClusterConnection.HBASE_CLIENT_CONNECTION_IMPL);
       delegate = createConnection(confForDelegate, es, user, connectionAttributes);

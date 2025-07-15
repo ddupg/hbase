@@ -46,6 +46,7 @@ import org.apache.hadoop.hbase.RegionLocations;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.metrics.ScanMetrics;
+import org.apache.hadoop.hbase.ipc.FatalConnectionException;
 import org.apache.hadoop.hbase.ipc.HBaseRpcController;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -142,8 +143,8 @@ public final class ConnectionUtils {
    */
   static class MasterlessConnection extends ConnectionImplementation {
     MasterlessConnection(Configuration conf, ExecutorService pool, User user,
-      Map<String, byte[]> requestAttributes) throws IOException {
-      super(conf, pool, user, requestAttributes);
+      ConnectionRegistry registry, Map<String, byte[]> requestAttributes) throws IOException {
+      super(conf, pool, user, registry, requestAttributes);
     }
 
     @Override
@@ -366,9 +367,9 @@ public final class ConnectionUtils {
     if (scanMetrics == null) {
       return;
     }
-    scanMetrics.countOfRPCcalls.incrementAndGet();
+    scanMetrics.addToCounter(ScanMetrics.RPC_CALLS_METRIC_NAME, 1);
     if (isRegionServerRemote) {
-      scanMetrics.countOfRemoteRPCcalls.incrementAndGet();
+      scanMetrics.addToCounter(ScanMetrics.REMOTE_RPC_CALLS_METRIC_NAME, 1);
     }
   }
 
@@ -376,9 +377,9 @@ public final class ConnectionUtils {
     if (scanMetrics == null) {
       return;
     }
-    scanMetrics.countOfRPCRetries.incrementAndGet();
+    scanMetrics.addToCounter(ScanMetrics.RPC_RETRIES_METRIC_NAME, 1);
     if (isRegionServerRemote) {
-      scanMetrics.countOfRemoteRPCRetries.incrementAndGet();
+      scanMetrics.addToCounter(ScanMetrics.REMOTE_RPC_RETRIES_METRIC_NAME, 1);
     }
   }
 
@@ -393,9 +394,9 @@ public final class ConnectionUtils {
         resultSize += PrivateCellUtil.estimatedSerializedSizeOf(cell);
       }
     }
-    scanMetrics.countOfBytesInResults.addAndGet(resultSize);
+    scanMetrics.addToCounter(ScanMetrics.BYTES_IN_RESULTS_METRIC_NAME, resultSize);
     if (isRegionServerRemote) {
-      scanMetrics.countOfBytesInRemoteResults.addAndGet(resultSize);
+      scanMetrics.addToCounter(ScanMetrics.BYTES_IN_REMOTE_RESULTS_METRIC_NAME, resultSize);
     }
   }
 
@@ -415,7 +416,7 @@ public final class ConnectionUtils {
     if (scanMetrics == null) {
       return;
     }
-    scanMetrics.countOfRegions.incrementAndGet();
+    scanMetrics.addToCounter(ScanMetrics.REGIONS_SCANNED_METRIC_NAME, 1);
   }
 
   /**
@@ -622,5 +623,14 @@ public final class ConnectionUtils {
       optMetrics.ifPresent(
         metrics -> ResultStatsUtil.updateStats(metrics, serverName, regionName, regionLoadStats));
     });
+  }
+
+  public static boolean isUnexpectedPreambleHeaderException(IOException e) {
+    if (!(e instanceof RemoteException)) {
+      return false;
+    }
+    RemoteException re = (RemoteException) e;
+    return FatalConnectionException.class.getName().equals(re.getClassName())
+      && re.getMessage().startsWith("Expected HEADER=");
   }
 }

@@ -31,6 +31,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.security.GeneralSecurityException;
+import java.security.cert.X509Certificate;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
@@ -46,6 +47,7 @@ import org.apache.hadoop.hbase.io.ByteBufferOutputStream;
 import org.apache.hadoop.hbase.io.crypto.aes.CryptoAES;
 import org.apache.hadoop.hbase.ipc.RpcServer.CallCleanup;
 import org.apache.hadoop.hbase.nio.ByteBuff;
+import org.apache.hadoop.hbase.regionserver.HRegionServer;
 import org.apache.hadoop.hbase.regionserver.RegionServerAbortedException;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
 import org.apache.hadoop.hbase.security.HBaseSaslRpcServer;
@@ -56,6 +58,7 @@ import org.apache.hadoop.hbase.security.provider.SaslServerAuthenticationProvide
 import org.apache.hadoop.hbase.security.provider.SaslServerAuthenticationProviders;
 import org.apache.hadoop.hbase.security.provider.SimpleSaslServerAuthenticationProvider;
 import org.apache.hadoop.hbase.trace.TraceUtil;
+import org.apache.hadoop.hbase.util.ByteBufferUtils;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.io.IntWritable;
@@ -85,7 +88,9 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.ConnectionHeader;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.RequestHeader;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.ResponseHeader;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.SecurityPreamableResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.UserInformation;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.RegistryProtos.GetConnectionRegistryResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.TracingProtos.RPCTInfo;
 
 /** Reads calls from a connection and queues them for handling. */
@@ -133,6 +138,7 @@ abstract class ServerRpcConnection implements Closeable {
   protected User user = null;
   protected UserGroupInformation ugi = null;
   protected SaslServerAuthenticationProviders saslProviders = null;
+  protected X509Certificate[] clientCertificateChain = null;
 
   public ServerRpcConnection(RpcServer rpcServer) {
     this.rpcServer = rpcServer;
@@ -345,10 +351,12 @@ abstract class ServerRpcConnection implements Closeable {
   }
 
   void finishSaslNegotiation() throws IOException {
-    String qop = saslServer.getNegotiatedQop();
+    String negotiatedQop = saslServer.getNegotiatedQop();
+    SaslUtil.verifyNegotiatedQop(saslServer.getRequestedQop(), negotiatedQop);
     ugi = provider.getAuthorizedUgi(saslServer.getAuthorizationID(), this.rpcServer.secretManager);
     RpcServer.LOG.debug(
-      "SASL server context established. Authenticated client: {}. Negotiated QoP is {}", ugi, qop);
+      "SASL server context established. Authenticated client: {}. Negotiated QoP is {}", ugi,
+      negotiatedQop);
     rpcServer.metrics.authenticationSuccess();
     RpcServer.AUDITLOG.info(RpcServer.AUTH_SUCCESSFUL_FOR + ugi);
   }
@@ -686,8 +694,46 @@ abstract class ServerRpcConnection implements Closeable {
   }
 
   private void doBadPreambleHandling(String msg, Exception e) throws IOException {
-    RpcServer.LOG.warn(msg);
+    RpcServer.LOG.warn(msg, e);
     doRespond(getErrorResponse(msg, e));
+  }
+
+  private void doPreambleResponse(Message resp) throws IOException {
+    ResponseHeader header = ResponseHeader.newBuilder().setCallId(-1).build();
+    ByteBuffer buf = ServerCall.createHeaderAndMessageBytes(resp, header, 0, null);
+    BufferChain bufChain = new BufferChain(buf);
+    doRespond(() -> bufChain);
+  }
+
+  private boolean doConnectionRegistryResponse() throws IOException {
+    if (!(rpcServer.server instanceof HRegionServer)) {
+      // should be in tests or some scenarios where we should not reach here
+      return false;
+    }
+    // on backup masters, this request may be blocked since we need to fetch it from filesystem,
+    // but since it is just backup master, it is not a critical problem
+    String clusterId = ((HRegionServer) rpcServer.server).getClusterId();
+    RpcServer.LOG.debug("Response connection registry, clusterId = '{}'", clusterId);
+    if (clusterId == null) {
+      // should be in tests or some scenarios where we should not reach here
+      return false;
+    }
+    GetConnectionRegistryResponse resp =
+      GetConnectionRegistryResponse.newBuilder().setClusterId(clusterId).build();
+    doPreambleResponse(resp);
+    return true;
+  }
+
+  private void doSecurityPreambleResponse() throws IOException {
+    if (rpcServer.isSecurityEnabled) {
+      SecurityPreamableResponse resp = SecurityPreamableResponse.newBuilder()
+        .setServerPrincipal(rpcServer.serverPrincipal).build();
+      doPreambleResponse(resp);
+    } else {
+      // security is not enabled, do not need a principal when connecting, throw a special exception
+      // to let client know it should just use simple authentication
+      doRespond(getErrorResponse("security is not enabled", new SecurityNotEnabledException()));
+    }
   }
 
   protected final void callCleanupIfNeeded() {
@@ -697,30 +743,49 @@ abstract class ServerRpcConnection implements Closeable {
     }
   }
 
-  protected final boolean processPreamble(ByteBuffer preambleBuffer) throws IOException {
-    assert preambleBuffer.remaining() == 6;
-    for (int i = 0; i < RPC_HEADER.length; i++) {
-      if (RPC_HEADER[i] != preambleBuffer.get()) {
-        doBadPreambleHandling(
-          "Expected HEADER=" + Bytes.toStringBinary(RPC_HEADER) + " but received HEADER="
-            + Bytes.toStringBinary(preambleBuffer.array(), 0, RPC_HEADER.length) + " from "
-            + toString());
-        return false;
-      }
-    }
-    int version = preambleBuffer.get() & 0xFF;
-    byte authbyte = preambleBuffer.get();
+  protected enum PreambleResponse {
+    SUCCEED, // successfully processed the rpc preamble header
+    CONTINUE, // the preamble header is for other purpose, wait for the rpc preamble header
+    CLOSE // close the rpc connection
+  }
 
-    if (version != RpcServer.CURRENT_VERSION) {
-      String msg = getFatalConnectionString(version, authbyte);
-      doBadPreambleHandling(msg, new WrongVersionException(msg));
-      return false;
+  protected final PreambleResponse processPreamble(ByteBuffer preambleBuffer) throws IOException {
+    assert preambleBuffer.remaining() == 6;
+    if (
+      ByteBufferUtils.equals(preambleBuffer, preambleBuffer.position(), 6,
+        RpcClient.REGISTRY_PREAMBLE_HEADER, 0, 6) && doConnectionRegistryResponse()
+    ) {
+      return PreambleResponse.CLOSE;
     }
-    this.provider = this.saslProviders.selectProvider(authbyte);
+    if (
+      ByteBufferUtils.equals(preambleBuffer, preambleBuffer.position(), 6,
+        RpcClient.SECURITY_PREAMBLE_HEADER, 0, 6)
+    ) {
+      doSecurityPreambleResponse();
+      return PreambleResponse.CONTINUE;
+    }
+    if (!ByteBufferUtils.equals(preambleBuffer, preambleBuffer.position(), 4, RPC_HEADER, 0, 4)) {
+      doBadPreambleHandling(
+        "Expected HEADER=" + Bytes.toStringBinary(RPC_HEADER) + " but received HEADER="
+          + Bytes.toStringBinary(
+            ByteBufferUtils.toBytes(preambleBuffer, preambleBuffer.position(), RPC_HEADER.length),
+            0, RPC_HEADER.length)
+          + " from " + toString());
+      return PreambleResponse.CLOSE;
+    }
+    int version = preambleBuffer.get(preambleBuffer.position() + 4) & 0xFF;
+    byte authByte = preambleBuffer.get(preambleBuffer.position() + 5);
+    if (version != RpcServer.CURRENT_VERSION) {
+      String msg = getFatalConnectionString(version, authByte);
+      doBadPreambleHandling(msg, new WrongVersionException(msg));
+      return PreambleResponse.CLOSE;
+    }
+
+    this.provider = this.saslProviders.selectProvider(authByte);
     if (this.provider == null) {
-      String msg = getFatalConnectionString(version, authbyte);
+      String msg = getFatalConnectionString(version, authByte);
       doBadPreambleHandling(msg, new BadAuthException(msg));
-      return false;
+      return PreambleResponse.CLOSE;
     }
     // TODO this is a wart while simple auth'n doesn't go through sasl.
     if (this.rpcServer.isSecurityEnabled && isSimpleAuthentication()) {
@@ -730,7 +795,7 @@ abstract class ServerRpcConnection implements Closeable {
       } else {
         AccessDeniedException ae = new AccessDeniedException("Authentication is required");
         doRespond(getErrorResponse(ae.getMessage(), ae));
-        return false;
+        return PreambleResponse.CLOSE;
       }
     }
     if (!this.rpcServer.isSecurityEnabled && !isSimpleAuthentication()) {
@@ -743,7 +808,7 @@ abstract class ServerRpcConnection implements Closeable {
       skipInitialSaslHandshake = true;
     }
     useSasl = !(provider instanceof SimpleSaslServerAuthenticationProvider);
-    return true;
+    return PreambleResponse.SUCCEED;
   }
 
   boolean isSimpleAuthentication() {

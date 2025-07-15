@@ -44,6 +44,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.ClusterMetricsBuilder;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.MasterNotRunningException;
 import org.apache.hadoop.hbase.MetaTableAccessor;
 import org.apache.hadoop.hbase.NamespaceDescriptor;
 import org.apache.hadoop.hbase.Server;
@@ -72,7 +73,6 @@ import org.apache.hadoop.hbase.ipc.RpcServer;
 import org.apache.hadoop.hbase.ipc.RpcServer.BlockingServiceAndInterface;
 import org.apache.hadoop.hbase.ipc.RpcServerFactory;
 import org.apache.hadoop.hbase.ipc.RpcServerInterface;
-import org.apache.hadoop.hbase.ipc.ServerNotRunningYetException;
 import org.apache.hadoop.hbase.ipc.ServerRpcController;
 import org.apache.hadoop.hbase.master.assignment.AssignmentManager;
 import org.apache.hadoop.hbase.master.assignment.RegionStateNode;
@@ -338,6 +338,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.GetSpaceQuo
 import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.GetSpaceQuotaRegionSizesResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.GetSpaceQuotaRegionSizesResponse.RegionSizes;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RecentLogs;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.FileArchiveNotificationRequest;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.FileArchiveNotificationResponse;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.GetLastFlushedSequenceIdRequest;
@@ -537,7 +538,8 @@ public class MasterRpcServices extends RSRpcServices
   }
 
   @Override
-  @QosPriority(priority = HConstants.ADMIN_QOS)
+  // priority for all RegionServerStatusProtos rpc's are set HIGH_QOS in
+  // MasterAnnotationReadingPriorityFunction itself
   public GetLastFlushedSequenceIdResponse getLastFlushedSequenceId(RpcController controller,
     GetLastFlushedSequenceIdRequest request) throws ServiceException {
     try {
@@ -552,7 +554,6 @@ public class MasterRpcServices extends RSRpcServices
   }
 
   @Override
-  @QosPriority(priority = HConstants.ADMIN_QOS)
   public RegionServerReportResponse regionServerReport(RpcController controller,
     RegionServerReportRequest request) throws ServiceException {
     try {
@@ -584,7 +585,6 @@ public class MasterRpcServices extends RSRpcServices
   }
 
   @Override
-  @QosPriority(priority = HConstants.ADMIN_QOS)
   public RegionServerStartupResponse regionServerStartup(RpcController controller,
     RegionServerStartupRequest request) throws ServiceException {
     // Register with server manager
@@ -616,7 +616,6 @@ public class MasterRpcServices extends RSRpcServices
   }
 
   @Override
-  @QosPriority(priority = HConstants.ADMIN_QOS)
   public ReportRSFatalErrorResponse reportRSFatalError(RpcController controller,
     ReportRSFatalErrorRequest request) throws ServiceException {
     String errorText = request.getErrorMessage();
@@ -1794,6 +1793,15 @@ public class MasterRpcServices extends RSRpcServices
     ReportRegionStateTransitionRequest req) throws ServiceException {
     try {
       master.checkServiceStarted();
+      for (RegionServerStatusProtos.RegionStateTransition transition : req.getTransitionList()) {
+        long procId =
+          transition.getProcIdCount() > 0 ? transition.getProcId(0) : Procedure.NO_PROC_ID;
+        // -1 is less than any possible MasterActiveCode
+        long initiatingMasterActiveTime = transition.hasInitiatingMasterActiveTime()
+          ? transition.getInitiatingMasterActiveTime()
+          : -1;
+        throwOnOldMaster(procId, initiatingMasterActiveTime);
+      }
       return master.getAssignmentManager().reportRegionStateTransition(req);
     } catch (IOException ioe) {
       throw new ServiceException(ioe);
@@ -1804,7 +1812,9 @@ public class MasterRpcServices extends RSRpcServices
   public SetQuotaResponse setQuota(RpcController c, SetQuotaRequest req) throws ServiceException {
     try {
       master.checkInitialized();
-      return master.getMasterQuotaManager().setQuota(req);
+      SetQuotaResponse response = master.getMasterQuotaManager().setQuota(req);
+      master.reloadRegionServerQuotas();
+      return response;
     } catch (Exception e) {
       throw new ServiceException(e);
     }
@@ -2544,8 +2554,14 @@ public class MasterRpcServices extends RSRpcServices
     // Check Masters is up and ready for duty before progressing. Remote side will keep trying.
     try {
       this.master.checkServiceStarted();
-    } catch (ServerNotRunningYetException snrye) {
-      throw new ServiceException(snrye);
+      for (RemoteProcedureResult result : request.getResultList()) {
+        // -1 is less than any possible MasterActiveCode
+        long initiatingMasterActiveTime =
+          result.hasInitiatingMasterActiveTime() ? result.getInitiatingMasterActiveTime() : -1;
+        throwOnOldMaster(result.getProcId(), initiatingMasterActiveTime);
+      }
+    } catch (IOException ioe) {
+      throw new ServiceException(ioe);
     }
     request.getResultList().forEach(result -> {
       if (result.getStatus() == RemoteProcedureResult.Status.SUCCESS) {
@@ -2556,6 +2572,18 @@ public class MasterRpcServices extends RSRpcServices
       }
     });
     return ReportProcedureDoneResponse.getDefaultInstance();
+  }
+
+  private void throwOnOldMaster(long procId, long initiatingMasterActiveTime)
+    throws MasterNotRunningException {
+    if (initiatingMasterActiveTime > master.getMasterActiveTime()) {
+      // procedure is initiated by new active master but report received on master with older active
+      // time
+      LOG.warn(
+        "Report for procId: {} and initiatingMasterAT {} received on master with activeTime {}",
+        procId, initiatingMasterActiveTime, master.getMasterActiveTime());
+      throw new MasterNotRunningException("Another master is active");
+    }
   }
 
   // HBCK Services

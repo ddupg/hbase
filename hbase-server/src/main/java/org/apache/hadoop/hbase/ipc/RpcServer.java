@@ -67,6 +67,7 @@ import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;
 import org.apache.hbase.thirdparty.com.google.gson.Gson;
 import org.apache.hbase.thirdparty.com.google.protobuf.BlockingService;
 import org.apache.hbase.thirdparty.com.google.protobuf.Descriptors.MethodDescriptor;
@@ -117,6 +118,7 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
     LoggerFactory.getLogger("SecurityLogger." + Server.class.getName());
   protected SecretManager<TokenIdentifier> secretManager;
   protected final Map<String, String> saslProps;
+  protected final String serverPrincipal;
 
   protected ServiceAuthorizationManager authManager;
 
@@ -211,7 +213,7 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
 
   protected final RpcScheduler scheduler;
 
-  protected UserProvider userProvider;
+  protected final UserProvider userProvider;
 
   protected final ByteBuffAllocator bbAllocator;
 
@@ -300,8 +302,11 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
     if (isSecurityEnabled) {
       saslProps = SaslUtil.initSaslProperties(conf.get("hbase.rpc.protection",
         QualityOfProtection.AUTHENTICATION.name().toLowerCase(Locale.ROOT)));
+      serverPrincipal = Preconditions.checkNotNull(userProvider.getCurrentUserName(),
+        "can not get current user name when security is enabled");
     } else {
       saslProps = Collections.emptyMap();
+      serverPrincipal = HConstants.EMPTY_STRING;
     }
 
     this.isOnlineLogProviderEnabled = getIsOnlineLogProviderEnabled(conf);
@@ -444,14 +449,17 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
       int totalTime = (int) (endTime - receiveTime);
       if (LOG.isTraceEnabled()) {
         LOG.trace(
-          "{}, response: {}, receiveTime: {}, queueTime: {}, processingTime: {}, totalTime: {}",
+          "{}, response: {}, receiveTime: {}, queueTime: {}, processingTime: {}, "
+            + "totalTime: {}, fsReadTime: {}",
           CurCall.get().toString(), TextFormat.shortDebugString(result),
-          CurCall.get().getReceiveTime(), qTime, processingTime, totalTime);
+          CurCall.get().getReceiveTime(), qTime, processingTime, totalTime,
+          CurCall.get().getFsReadTime());
       }
       // Use the raw request call size for now.
       long requestSize = call.getSize();
       long responseSize = result.getSerializedSize();
       long responseBlockSize = call.getBlockBytesScanned();
+      long fsReadTime = call.getFsReadTime();
       if (call.isClientCellBlockSupported()) {
         // Include the payload size in HBaseRpcController
         responseSize += call.getResponseCellSize();
@@ -472,13 +480,13 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
         // note that large responses will often also be slow.
         logResponse(param, md.getName(), md.getName() + "(" + param.getClass().getName() + ")",
           tooLarge, tooSlow, status.getClient(), startTime, processingTime, qTime, responseSize,
-          responseBlockSize, userName);
+          responseBlockSize, fsReadTime, userName);
         if (this.namedQueueRecorder != null && this.isOnlineLogProviderEnabled) {
           // send logs to ring buffer owned by slowLogRecorder
           final String className =
             server == null ? StringUtils.EMPTY : server.getClass().getSimpleName();
           this.namedQueueRecorder.addRecord(new RpcLogDetails(call, param, status.getClient(),
-            responseSize, responseBlockSize, className, tooSlow, tooLarge));
+            responseSize, responseBlockSize, fsReadTime, className, tooSlow, tooLarge));
         }
       }
       return new Pair<>(result, controller.cellScanner());
@@ -522,7 +530,7 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
    */
   void logResponse(Message param, String methodName, String call, boolean tooLarge, boolean tooSlow,
     String clientAddress, long startTime, int processingTime, int qTime, long responseSize,
-    long blockBytesScanned, String userName) {
+    long blockBytesScanned, long fsReadTime, String userName) {
     final String className = server == null ? StringUtils.EMPTY : server.getClass().getSimpleName();
     // base information that is reported regardless of type of call
     Map<String, Object> responseInfo = new HashMap<>();
@@ -531,6 +539,7 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
     responseInfo.put("queuetimems", qTime);
     responseInfo.put("responsesize", responseSize);
     responseInfo.put("blockbytesscanned", blockBytesScanned);
+    responseInfo.put("fsreadtime", fsReadTime);
     responseInfo.put("client", clientAddress);
     responseInfo.put("class", className);
     responseInfo.put("method", methodName);
@@ -736,10 +745,9 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
   }
 
   /**
-   * Used by {@link org.apache.hadoop.hbase.procedure2.store.region.RegionProcedureStore}. For
-   * master's rpc call, it may generate new procedure and mutate the region which store procedure.
-   * There are some check about rpc when mutate region, such as rpc timeout check. So unset the rpc
-   * call to avoid the rpc check.
+   * Used by {@link org.apache.hadoop.hbase.master.region.MasterRegion}, to avoid hit row lock
+   * timeout when updating master region in a rpc call. See HBASE-23895, HBASE-29251 and HBASE-29294
+   * for more details.
    * @return the currently ongoing rpc call
    */
   public static Optional<RpcCall> unsetCurrentCall() {
@@ -749,8 +757,8 @@ public abstract class RpcServer implements RpcServerInterface, ConfigurationObse
   }
 
   /**
-   * Used by {@link org.apache.hadoop.hbase.procedure2.store.region.RegionProcedureStore}. Set the
-   * rpc call back after mutate region.
+   * Used by {@link org.apache.hadoop.hbase.master.region.MasterRegion}. Set the rpc call back after
+   * mutate region.
    */
   public static void setCurrentCall(RpcCall rpcCall) {
     CurCall.set(rpcCall);

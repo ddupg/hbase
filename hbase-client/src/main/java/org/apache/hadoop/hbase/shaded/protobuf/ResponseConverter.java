@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.CheckAndMutateResult;
+import org.apache.hadoop.hbase.client.QueryMetrics;
 import org.apache.hadoop.hbase.client.RegionInfo;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.SingleResponse;
@@ -165,8 +166,12 @@ public final class ResponseConverter {
           if (!r.isEmpty()) {
             result = r;
           }
-          results.add(regionName, roe.getIndex(),
-            new CheckAndMutateResult(actionResult.getProcessed(), result));
+          CheckAndMutateResult camResult =
+            new CheckAndMutateResult(actionResult.getProcessed(), result);
+          if (roe.hasMetrics()) {
+            camResult.setMetrics(ProtobufUtil.toQueryMetrics(roe.getMetrics()));
+          }
+          results.add(regionName, roe.getIndex(), camResult);
         }
       } else {
         if (actionResult.hasProcessed()) {
@@ -212,6 +217,7 @@ public final class ResponseConverter {
   private static CheckAndMutateResult getCheckAndMutateResult(RegionActionResult actionResult,
     CellScanner cells) throws IOException {
     Result result = null;
+    QueryMetrics metrics = null;
     if (actionResult.getResultOrExceptionCount() > 0) {
       // Get the result of the Increment/Append operations from the first element of the
       // ResultOrException list
@@ -222,8 +228,12 @@ public final class ResponseConverter {
           result = r;
         }
       }
+
+      if (roe.hasMetrics()) {
+        metrics = ProtobufUtil.toQueryMetrics(roe.getMetrics());
+      }
     }
-    return new CheckAndMutateResult(actionResult.getProcessed(), result);
+    return new CheckAndMutateResult(actionResult.getProcessed(), result).setMetrics(metrics);
   }
 
   private static Result getMutateRowResult(RegionActionResult actionResult, CellScanner cells)
@@ -258,10 +268,16 @@ public final class ResponseConverter {
     ClientProtos.MutateResponse mutateResponse, CellScanner cells) throws IOException {
     boolean success = mutateResponse.getProcessed();
     Result result = null;
+    QueryMetrics metrics = null;
     if (mutateResponse.hasResult()) {
       result = ProtobufUtil.toResult(mutateResponse.getResult(), cells);
     }
-    return new CheckAndMutateResult(success, result);
+
+    if (mutateResponse.hasMetrics()) {
+      metrics = ProtobufUtil.toQueryMetrics(mutateResponse.getMetrics());
+    }
+
+    return new CheckAndMutateResult(success, result).setMetrics(metrics);
   }
 
   /**
@@ -436,6 +452,7 @@ public final class ResponseConverter {
     int noOfResults =
       cellScanner != null ? response.getCellsPerResultCount() : response.getResultsCount();
     Result[] results = new Result[noOfResults];
+    List<ClientProtos.QueryMetrics> queryMetrics = response.getQueryMetricsList();
     for (int i = 0; i < noOfResults; i++) {
       if (cellScanner != null) {
         // Cells are out in cellblocks. Group them up again as Results. How many to read at a
@@ -471,6 +488,12 @@ public final class ResponseConverter {
       } else {
         // Result is pure pb.
         results[i] = ProtobufUtil.toResult(response.getResults(i));
+      }
+
+      // Populate result metrics if they exist
+      if (queryMetrics.size() > i) {
+        QueryMetrics metrics = ProtobufUtil.toQueryMetrics(queryMetrics.get(i));
+        results[i].setMetrics(metrics);
       }
     }
     return results;

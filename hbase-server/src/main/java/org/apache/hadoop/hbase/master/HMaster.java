@@ -140,6 +140,7 @@ import org.apache.hadoop.hbase.master.http.MasterDumpServlet;
 import org.apache.hadoop.hbase.master.http.MasterRedirectServlet;
 import org.apache.hadoop.hbase.master.http.MasterStatusServlet;
 import org.apache.hadoop.hbase.master.http.api_v1.ResourceConfigFactory;
+import org.apache.hadoop.hbase.master.http.hbck.HbckConfigFactory;
 import org.apache.hadoop.hbase.master.janitor.CatalogJanitor;
 import org.apache.hadoop.hbase.master.locking.LockManager;
 import org.apache.hadoop.hbase.master.migrate.RollingUpgradeChore;
@@ -161,6 +162,8 @@ import org.apache.hadoop.hbase.master.procedure.MasterProcedureUtil.NonceProcedu
 import org.apache.hadoop.hbase.master.procedure.ModifyTableProcedure;
 import org.apache.hadoop.hbase.master.procedure.ProcedurePrepareLatch;
 import org.apache.hadoop.hbase.master.procedure.ProcedureSyncWait;
+import org.apache.hadoop.hbase.master.procedure.RSProcedureDispatcher;
+import org.apache.hadoop.hbase.master.procedure.ReloadQuotasProcedure;
 import org.apache.hadoop.hbase.master.procedure.ReopenTableRegionsProcedure;
 import org.apache.hadoop.hbase.master.procedure.ServerCrashProcedure;
 import org.apache.hadoop.hbase.master.procedure.TruncateRegionProcedure;
@@ -238,6 +241,7 @@ import org.apache.hadoop.hbase.util.HFileArchiveUtil;
 import org.apache.hadoop.hbase.util.IdLock;
 import org.apache.hadoop.hbase.util.ModifyRegionUtils;
 import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.ReflectionUtils;
 import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.hadoop.hbase.util.RetryCounterFactory;
 import org.apache.hadoop.hbase.util.TableDescriptorChecker;
@@ -451,6 +455,15 @@ public class HMaster extends HRegionServer implements MasterServices {
   public static final String WARMUP_BEFORE_MOVE = "hbase.master.warmup.before.move";
   private static final boolean DEFAULT_WARMUP_BEFORE_MOVE = true;
 
+  /**
+   * Use RSProcedureDispatcher instance to initiate master to rs remote procedure execution. Use
+   * this config to extend RSProcedureDispatcher (mainly for testing purpose).
+   */
+  public static final String HBASE_MASTER_RSPROC_DISPATCHER_CLASS =
+    "hbase.master.rsproc.dispatcher.class";
+  private static final String DEFAULT_HBASE_MASTER_RSPROC_DISPATCHER_CLASS =
+    RSProcedureDispatcher.class.getName();
+
   private TaskGroup startupTaskGroup;
 
   /**
@@ -508,7 +521,6 @@ public class HMaster extends HRegionServer implements MasterServices {
         HConstants.DEFAULT_HBASE_MASTER_BALANCER_MAX_RIT_PERCENT);
 
       // Do we publish the status?
-
       boolean shouldPublish =
         conf.getBoolean(HConstants.STATUS_PUBLISHED, HConstants.STATUS_PUBLISHED_DEFAULT);
       Class<? extends ClusterStatusPublisher.Publisher> publisherClass =
@@ -741,6 +753,7 @@ public class HMaster extends HRegionServer implements MasterServices {
   protected void configureInfoServer() {
     infoServer.addUnprivilegedServlet("master-status", "/master-status", MasterStatusServlet.class);
     infoServer.addUnprivilegedServlet("api_v1", "/api/v1/*", buildApiV1Servlet());
+    infoServer.addUnprivilegedServlet("hbck", "/hbck/*", buildHbckServlet());
 
     infoServer.setAttribute(MASTER, this);
     if (LoadBalancer.isTablesOnMaster(conf)) {
@@ -750,6 +763,11 @@ public class HMaster extends HRegionServer implements MasterServices {
 
   private ServletHolder buildApiV1Servlet() {
     final ResourceConfig config = ResourceConfigFactory.createResourceConfig(conf, this);
+    return new ServletHolder(new ServletContainer(config));
+  }
+
+  private ServletHolder buildHbckServlet() {
+    final ResourceConfig config = HbckConfigFactory.createResourceConfig(conf, this);
     return new ServletHolder(new ServletContainer(config));
   }
 
@@ -967,7 +985,10 @@ public class HMaster extends HRegionServer implements MasterServices {
     masterRegion = MasterRegionFactory.create(this);
     rsListStorage = new MasterRegionServerList(masterRegion, this);
 
+    // Initialize the ServerManager and register it as a configuration observer
     this.serverManager = createServerManager(this, rsListStorage);
+    this.configurationManager.registerObserver(this.serverManager);
+
     if (
       !conf.getBoolean(HBASE_SPLIT_WAL_COORDINATED_BY_ZK, DEFAULT_HBASE_SPLIT_COORDINATED_BY_ZK)
     ) {
@@ -1320,6 +1341,22 @@ public class HMaster extends HRegionServer implements MasterServices {
     getChoreService().scheduleChore(this.oldWALsDirSizeChore);
 
     status.markComplete("Progress after master initialized complete");
+  }
+
+  /**
+   * Used for testing only to set Mock objects.
+   * @param hbckChore hbckChore
+   */
+  public void setHbckChoreForTesting(HbckChore hbckChore) {
+    this.hbckChore = hbckChore;
+  }
+
+  /**
+   * Used for testing only to set Mock objects.
+   * @param catalogJanitorChore catalogJanitorChore
+   */
+  public void setCatalogJanitorChoreForTesting(CatalogJanitor catalogJanitorChore) {
+    this.catalogJanitorChore = catalogJanitorChore;
   }
 
   private void createMissingCFsInMetaDuringUpgrade(TableDescriptor metaDescriptor)
@@ -1747,7 +1784,11 @@ public class HMaster extends HRegionServer implements MasterServices {
   }
 
   private void createProcedureExecutor() throws IOException {
-    MasterProcedureEnv procEnv = new MasterProcedureEnv(this);
+    final String procedureDispatcherClassName =
+      conf.get(HBASE_MASTER_RSPROC_DISPATCHER_CLASS, DEFAULT_HBASE_MASTER_RSPROC_DISPATCHER_CLASS);
+    final RSProcedureDispatcher procedureDispatcher = ReflectionUtils.instantiateWithCustomCtor(
+      procedureDispatcherClassName, new Class[] { MasterServices.class }, new Object[] { this });
+    final MasterProcedureEnv procEnv = new MasterProcedureEnv(this, procedureDispatcher);
     procedureStore = new RegionProcedureStore(this, masterRegion,
       new MasterProcedureEnv.FsUtilsLeaseRecovery(this));
     procedureStore.registerListener(new ProcedureStoreListener() {
@@ -2089,10 +2130,14 @@ public class HMaster extends HRegionServer implements MasterServices {
         // TODO: bulk assign
         try {
           this.assignmentManager.balance(plan);
+          this.balancer.updateClusterMetrics(getClusterMetricsWithoutCoprocessor());
+          this.balancer.throttle(plan);
         } catch (HBaseIOException hioe) {
           // should ignore failed plans here, avoiding the whole balance plans be aborted
           // later calls of balance() can fetch up the failed and skipped plans
           LOG.warn("Failed balance plan {}, skipping...", plan, hioe);
+        } catch (Exception e) {
+          LOG.warn("Failed throttling assigning a new plan.", e);
         }
         // rpCount records balance plans processed, does not care if a plan succeeds
         rpCount++;
@@ -2142,7 +2187,7 @@ public class HMaster extends HRegionServer implements MasterServices {
 
     final Set<TableName> matchingTables = getTableDescriptors(new LinkedList<>(),
       ntfp.getNamespace(), ntfp.getRegex(), ntfp.getTableNames(), false).stream()
-        .map(TableDescriptor::getTableName).collect(Collectors.toSet());
+      .map(TableDescriptor::getTableName).collect(Collectors.toSet());
     final Set<TableName> allEnabledTables =
       tableStateManager.getTablesInStates(TableState.State.ENABLED);
     final List<TableName> targetTables =
@@ -2172,21 +2217,26 @@ public class HMaster extends HRegionServer implements MasterServices {
     final long nonce) throws IOException {
     checkInitialized();
 
+    final String regionNamesToLog = RegionInfo.getShortNameToLog(regionsToMerge);
+
     if (!isSplitOrMergeEnabled(MasterSwitchType.MERGE)) {
-      String regionsStr = Arrays.deepToString(regionsToMerge);
-      LOG.warn("Merge switch is off! skip merge of " + regionsStr);
+      LOG.warn("Merge switch is off! skip merge of " + regionNamesToLog);
       throw new DoNotRetryIOException(
-        "Merge of " + regionsStr + " failed because merge switch is off");
+        "Merge of " + regionNamesToLog + " failed because merge switch is off");
     }
 
-    final String mergeRegionsStr = Arrays.stream(regionsToMerge).map(RegionInfo::getEncodedName)
-      .collect(Collectors.joining(", "));
+    if (!getTableDescriptors().get(regionsToMerge[0].getTable()).isMergeEnabled()) {
+      LOG.warn("Merge is disabled for the table! Skipping merge of {}", regionNamesToLog);
+      throw new DoNotRetryIOException(
+        "Merge of " + regionNamesToLog + " failed as region merge is disabled for the table");
+    }
+
     return MasterProcedureUtil.submitProcedure(new NonceProcedureRunnable(this, ng, nonce) {
       @Override
       protected void run() throws IOException {
         getMaster().getMasterCoprocessorHost().preMergeRegions(regionsToMerge);
         String aid = getClientIdAuditPrefix();
-        LOG.info("{} merge regions {}", aid, mergeRegionsStr);
+        LOG.info("{} merge regions {}", aid, regionNamesToLog);
         submitProcedure(new MergeTableRegionsProcedure(procedureExecutor.getEnvironment(),
           regionsToMerge, forcible));
         getMaster().getMasterCoprocessorHost().postMergeRegions(regionsToMerge);
@@ -2208,6 +2258,12 @@ public class HMaster extends HRegionServer implements MasterServices {
       LOG.warn("Split switch is off! skip split of " + regionInfo);
       throw new DoNotRetryIOException(
         "Split region " + regionInfo.getRegionNameAsString() + " failed due to split switch off");
+    }
+
+    if (!getTableDescriptors().get(regionInfo.getTable()).isSplitEnabled()) {
+      LOG.warn("Split is disabled for the table! Skipping split of {}", regionInfo);
+      throw new DoNotRetryIOException("Split region " + regionInfo.getRegionNameAsString()
+        + " failed as region split is disabled for the table");
     }
 
     return MasterProcedureUtil
@@ -2661,16 +2717,20 @@ public class HMaster extends HRegionServer implements MasterServices {
           MasterQuotaManager quotaManager = getMasterQuotaManager();
           if (quotaManager != null) {
             if (quotaManager.isQuotaInitialized()) {
-              SpaceQuotaSnapshot currSnapshotOfTable =
-                QuotaTableUtil.getCurrentSnapshotFromQuotaTable(getConnection(), tableName);
-              if (currSnapshotOfTable != null) {
-                SpaceQuotaStatus quotaStatus = currSnapshotOfTable.getQuotaStatus();
-                if (
-                  quotaStatus.isInViolation()
-                    && SpaceViolationPolicy.DISABLE == quotaStatus.getPolicy().orElse(null)
-                ) {
-                  throw new AccessDeniedException("Enabling the table '" + tableName
-                    + "' is disallowed due to a violated space quota.");
+              // skip checking quotas for system tables, see:
+              // https://issues.apache.org/jira/browse/HBASE-28183
+              if (!tableName.isSystemTable()) {
+                SpaceQuotaSnapshot currSnapshotOfTable =
+                  QuotaTableUtil.getCurrentSnapshotFromQuotaTable(getConnection(), tableName);
+                if (currSnapshotOfTable != null) {
+                  SpaceQuotaStatus quotaStatus = currSnapshotOfTable.getQuotaStatus();
+                  if (
+                    quotaStatus.isInViolation()
+                      && SpaceViolationPolicy.DISABLE == quotaStatus.getPolicy().orElse(null)
+                  ) {
+                    throw new AccessDeniedException("Enabling the table '" + tableName
+                      + "' is disallowed due to a violated space quota.");
+                  }
                 }
               }
             } else if (LOG.isTraceEnabled()) {
@@ -2860,6 +2920,12 @@ public class HMaster extends HRegionServer implements MasterServices {
     if (!ts.isDisabled()) {
       throw new TableNotDisabledException("Not DISABLED; " + ts);
     }
+  }
+
+  public void reloadRegionServerQuotas() {
+    // multiple reloads are harmless, so no need for NonceProcedureRunnable
+    getLiveRegionServers()
+      .forEach(sn -> procedureExecutor.submitProcedure(new ReloadQuotasProcedure(sn)));
   }
 
   public ClusterMetrics getClusterMetricsWithoutCoprocessor() throws InterruptedIOException {
@@ -3068,6 +3134,7 @@ public class HMaster extends HRegionServer implements MasterServices {
   }
 
   /** Returns timestamp in millis when HMaster became the active master. */
+  @Override
   public long getMasterActiveTime() {
     return masterActiveTime;
   }
@@ -4173,6 +4240,7 @@ public class HMaster extends HRegionServer implements MasterServices {
     return super.getWalGroupsReplicationStatus();
   }
 
+  @Override
   public HbckChore getHbckChore() {
     return this.hbckChore;
   }

@@ -18,7 +18,9 @@
 package org.apache.hadoop.hbase.master.assignment;
 
 import static org.apache.hadoop.hbase.io.hfile.CacheConfig.DEFAULT_EVICT_ON_CLOSE;
+import static org.apache.hadoop.hbase.io.hfile.CacheConfig.DEFAULT_EVICT_ON_SPLIT;
 import static org.apache.hadoop.hbase.io.hfile.CacheConfig.EVICT_BLOCKS_ON_CLOSE_KEY;
+import static org.apache.hadoop.hbase.io.hfile.CacheConfig.EVICT_BLOCKS_ON_SPLIT_KEY;
 import static org.apache.hadoop.hbase.master.LoadBalancer.BOGUS_SERVER_NAME;
 import static org.apache.hadoop.hbase.master.assignment.AssignmentManager.FORCE_REGION_RETAINMENT;
 
@@ -37,7 +39,6 @@ import org.apache.hadoop.hbase.master.ServerManager;
 import org.apache.hadoop.hbase.master.procedure.AbstractStateMachineRegionProcedure;
 import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;
 import org.apache.hadoop.hbase.master.procedure.ServerCrashProcedure;
-import org.apache.hadoop.hbase.procedure2.Procedure;
 import org.apache.hadoop.hbase.procedure2.ProcedureMetrics;
 import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;
 import org.apache.hadoop.hbase.procedure2.ProcedureSuspendedException;
@@ -333,11 +334,15 @@ public class TransitRegionStateProcedure
     if (regionNode.isInState(State.OPEN, State.CLOSING, State.MERGING, State.SPLITTING)) {
       // this is the normal case
       env.getAssignmentManager().regionClosing(regionNode);
-      CloseRegionProcedure closeProc = isSplit
-        ? new CloseRegionProcedure(this, getRegion(), regionNode.getRegionLocation(),
-          assignCandidate, true)
-        : new CloseRegionProcedure(this, getRegion(), regionNode.getRegionLocation(),
-          assignCandidate, evictCache);
+      LOG.debug("Close region: isSplit: {}: evictOnSplit: {}: evictOnClose: {}", isSplit,
+        env.getMasterConfiguration().getBoolean(EVICT_BLOCKS_ON_SPLIT_KEY, DEFAULT_EVICT_ON_SPLIT),
+        evictCache);
+      // Splits/Merges are special cases, rather than deciding on the cache eviction behaviour here
+      // at
+      // Master, we just need to tell this close is for a split/merge and let RSes decide on the
+      // eviction. See HBASE-28811 for more context.
+      CloseRegionProcedure closeProc = new CloseRegionProcedure(this, getRegion(),
+        regionNode.getRegionLocation(), assignCandidate, isSplit);
       addChildProcedure(closeProc);
       setNextState(RegionStateTransitionState.REGION_STATE_TRANSITION_CONFIRM_CLOSED);
     } else {
@@ -386,19 +391,18 @@ public class TransitRegionStateProcedure
     return Flow.HAS_MORE_STATE;
   }
 
-  // Override to lock RegionStateNode
-  @SuppressWarnings("rawtypes")
   @Override
-  protected Procedure[] execute(MasterProcedureEnv env)
-    throws ProcedureSuspendedException, ProcedureYieldException, InterruptedException {
+  protected void beforeExec(MasterProcedureEnv env) {
     RegionStateNode regionNode =
       env.getAssignmentManager().getRegionStates().getOrCreateRegionStateNode(getRegion());
     regionNode.lock();
-    try {
-      return super.execute(env);
-    } finally {
-      regionNode.unlock();
-    }
+  }
+
+  @Override
+  protected void afterExec(MasterProcedureEnv env) {
+    RegionStateNode regionNode =
+      env.getAssignmentManager().getRegionStates().getOrCreateRegionStateNode(getRegion());
+    regionNode.unlock();
   }
 
   private RegionStateNode getRegionStateNode(MasterProcedureEnv env) {

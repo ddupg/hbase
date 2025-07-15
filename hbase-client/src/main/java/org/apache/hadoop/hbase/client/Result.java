@@ -97,6 +97,7 @@ public class Result implements CellScannable, CellScanner {
    */
   private int cellScannerIndex = INITIAL_CELLSCANNER_INDEX;
   private RegionLoadStats stats;
+  private QueryMetrics metrics = null;
 
   private final boolean readonly;
 
@@ -125,19 +126,19 @@ public class Result implements CellScannable, CellScanner {
    * <strong>Note:</strong> You must ensure that the keyvalues are already sorted.
    * @param cells List of cells
    */
-  public static Result create(List<Cell> cells) {
+  public static Result create(List<? extends Cell> cells) {
     return create(cells, null);
   }
 
-  public static Result create(List<Cell> cells, Boolean exists) {
+  public static Result create(List<? extends Cell> cells, Boolean exists) {
     return create(cells, exists, false);
   }
 
-  public static Result create(List<Cell> cells, Boolean exists, boolean stale) {
+  public static Result create(List<? extends Cell> cells, Boolean exists, boolean stale) {
     return create(cells, exists, stale, false);
   }
 
-  public static Result create(List<Cell> cells, Boolean exists, boolean stale,
+  public static Result create(List<? extends Cell> cells, Boolean exists, boolean stale,
     boolean mayHaveMoreCellsInRow) {
     if (exists != null) {
       return new Result(null, exists, stale, mayHaveMoreCellsInRow);
@@ -903,12 +904,22 @@ public class Result implements CellScannable, CellScanner {
     this.stats = loadStats;
   }
 
+  @InterfaceAudience.Private
+  public void setMetrics(QueryMetrics metrics) {
+    this.metrics = metrics;
+  }
+
   /**
    * Returns the associated statistics about the region from which this was returned. Can be
    * <tt>null</tt> if stats are disabled.
    */
   public RegionLoadStats getStats() {
     return stats;
+  }
+
+  /** Returns the query metrics, or {@code null} if we do not enable metrics. */
+  public QueryMetrics getMetrics() {
+    return metrics;
   }
 
   /**

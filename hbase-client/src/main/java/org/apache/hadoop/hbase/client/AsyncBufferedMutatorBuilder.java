@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.client;
 
 import static org.apache.hadoop.hbase.client.ConnectionUtils.retries2Attempts;
 
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.apache.yetus.audience.InterfaceAudience;
 
@@ -102,6 +103,35 @@ public interface AsyncBufferedMutatorBuilder {
    * {@code hbase.client.keyvalue.maxsize}.
    */
   AsyncBufferedMutatorBuilder setMaxKeyValueSize(int maxKeyValueSize);
+
+  /**
+   * Set a rpc request attribute.
+   * <p>
+   * Introduced in 2.6.1. Any custom implementations of this class should implement this method in
+   * order to take advantage of the new behavior.
+   * </p>
+   */
+  default AsyncBufferedMutatorBuilder setRequestAttribute(String key, byte[] value) {
+    throw new UnsupportedOperationException("Not implemented");
+  }
+
+  /**
+   * Set multiple rpc request attributes.
+   * <p>
+   * Introduced in 2.6.1. Any custom implementations of this class should implement this method in
+   * order to take advantage of the new behavior.
+   * </p>
+   */
+  default AsyncBufferedMutatorBuilder setRequestAttributes(Map<String, byte[]> requestAttributes) {
+    throw new UnsupportedOperationException("Not implemented");
+  }
+
+  /**
+   * Set the maximum number of mutations that this buffered mutator will buffer before flushing
+   * them. If you are talking to a cluster that uses hbase.rpc.rows.size.threshold.reject to reject
+   * large Multi requests, you may need this setting to avoid rejections. Default is no limit.
+   */
+  AsyncBufferedMutatorBuilder setMaxMutations(int maxMutations);
 
   /**
    * Create the {@link AsyncBufferedMutator} instance.

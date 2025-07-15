@@ -17,11 +17,18 @@
  */
 package org.apache.hadoop.hbase.master.procedure;
 
+import com.google.errorprone.annotations.RestrictedApi;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableExistsException;
 import org.apache.hadoop.hbase.TableName;
@@ -107,9 +114,17 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
   private PeerQueue peerMap = null;
   private MetaQueue metaMap = null;
 
+  private final Function<Long, Procedure<?>> procedureRetriever;
   private final SchemaLocking locking;
 
+  // To prevent multiple Create/Modify/Disable/Enable table procedure run at the same time, we will
+  // keep table procedure in this queue first before actually enqueuing it to tableQueue
+  // Seee HBASE-28683 for more details
+  private final Map<TableName, TableProcedureWaitingQueue> tableProcsWaitingEnqueue =
+    new HashMap<>();
+
   public MasterProcedureScheduler(Function<Long, Procedure<?>> procedureRetriever) {
+    this.procedureRetriever = procedureRetriever;
     locking = new SchemaLocking(procedureRetriever);
   }
 
@@ -118,11 +133,26 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
     push(proc, false, true);
   }
 
+  private boolean shouldWaitBeforeEnqueuing(TableProcedureInterface proc) {
+    return TableQueue.requireTableExclusiveLock(proc);
+  }
+
   @Override
   protected void enqueue(final Procedure proc, final boolean addFront) {
     if (isMetaProcedure(proc)) {
       doAdd(metaRunQueue, getMetaQueue(), proc, addFront);
     } else if (isTableProcedure(proc)) {
+      TableProcedureInterface tableProc = (TableProcedureInterface) proc;
+      if (shouldWaitBeforeEnqueuing(tableProc)) {
+        TableProcedureWaitingQueue waitingQueue = tableProcsWaitingEnqueue.computeIfAbsent(
+          tableProc.getTableName(), k -> new TableProcedureWaitingQueue(procedureRetriever));
+        if (!waitingQueue.procedureSubmitted(proc)) {
+          // there is a table procedure for this table already enqueued, waiting
+          LOG.debug("There is already a procedure running for table {}, added {} to waiting queue",
+            tableProc.getTableName(), proc);
+          return;
+        }
+      }
       doAdd(tableRunQueue, getTableQueue(getTableName(proc)), proc, addFront);
     } else if (isServerProcedure(proc)) {
       ServerProcedureInterface spi = (ServerProcedureInterface) proc;
@@ -264,6 +294,7 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
     // Remove Tables
     clear(tableMap, tableRunQueue, TABLE_QUEUE_KEY_COMPARATOR);
     tableMap = null;
+    tableProcsWaitingEnqueue.clear();
 
     // Remove Peers
     clear(peerMap, peerRunQueue, PEER_QUEUE_KEY_COMPARATOR);
@@ -301,17 +332,46 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
     count += queueSize(tableMap);
     count += queueSize(peerMap);
     count += queueSize(metaMap);
+    for (TableProcedureWaitingQueue waitingQ : tableProcsWaitingEnqueue.values()) {
+      count += waitingQ.waitingSize();
+    }
     return count;
   }
 
   @Override
   public void completionCleanup(final Procedure proc) {
-    if (proc instanceof TableProcedureInterface) {
-      TableProcedureInterface iProcTable = (TableProcedureInterface) proc;
+    if (isTableProcedure(proc)) {
+      TableProcedureInterface tableProc = (TableProcedureInterface) proc;
+      if (shouldWaitBeforeEnqueuing(tableProc)) {
+        schedLock();
+        try {
+          TableProcedureWaitingQueue waitingQueue =
+            tableProcsWaitingEnqueue.get(tableProc.getTableName());
+          if (waitingQueue != null) {
+            Optional<Procedure<?>> nextProc = waitingQueue.procedureCompleted(proc);
+            if (nextProc.isPresent()) {
+              // enqueue it
+              Procedure<?> next = nextProc.get();
+              LOG.debug("{} completed, enqueue a new procedure {}", proc, next);
+              doAdd(tableRunQueue, getTableQueue(tableProc.getTableName()), next, false);
+            } else {
+              if (waitingQueue.isEmpty()) {
+                // there is no waiting procedures in it, remove
+                tableProcsWaitingEnqueue.remove(tableProc.getTableName());
+              }
+            }
+          } else {
+            // this should not happen normally, warn it
+            LOG.warn("no waiting queue while completing {}, which should not happen", proc);
+          }
+        } finally {
+          schedUnlock();
+        }
+      }
       boolean tableDeleted;
       if (proc.hasException()) {
         Exception procEx = proc.getException().unwrapRemoteException();
-        if (iProcTable.getTableOperationType() == TableOperationType.CREATE) {
+        if (tableProc.getTableOperationType() == TableOperationType.CREATE) {
           // create failed because the table already exist
           tableDeleted = !(procEx instanceof TableExistsException);
         } else {
@@ -320,11 +380,10 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
         }
       } else {
         // the table was deleted
-        tableDeleted = (iProcTable.getTableOperationType() == TableOperationType.DELETE);
+        tableDeleted = (tableProc.getTableOperationType() == TableOperationType.DELETE);
       }
       if (tableDeleted) {
-        markTableAsDeleted(iProcTable.getTableName(), proc);
-        return;
+        markTableAsDeleted(tableProc.getTableName(), proc);
       }
     } else if (proc instanceof PeerProcedureInterface) {
       tryCleanupPeerQueue(getPeerId(proc), proc);
@@ -361,7 +420,9 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
   // ============================================================================
   private TableQueue getTableQueue(TableName tableName) {
     TableQueue node = AvlTree.get(tableMap, tableName, TABLE_QUEUE_KEY_COMPARATOR);
-    if (node != null) return node;
+    if (node != null) {
+      return node;
+    }
 
     node = new TableQueue(tableName, MasterProcedureUtil.getTablePriority(tableName),
       locking.getTableLock(tableName), locking.getNamespaceLock(tableName.getNamespaceAsString()));
@@ -372,6 +433,21 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
   private void removeTableQueue(TableName tableName) {
     tableMap = AvlTree.remove(tableMap, tableName, TABLE_QUEUE_KEY_COMPARATOR);
     locking.removeTableLock(tableName);
+  }
+
+  /**
+   * Tries to remove the queue and the table-lock of the specified table. If there are new
+   * operations pending (e.g. a new create), the remove will not be performed.
+   * @param table     the name of the table that should be marked as deleted
+   * @param procedure the procedure that is removing the table
+   * @return true if deletion succeeded, false otherwise meaning that there are other new operations
+   *         pending for that table (e.g. a new create).
+   */
+  @RestrictedApi(explanation = "Should only be called in tests", link = "",
+      allowedOnPath = ".*/(MasterProcedureScheduler.java|src/test/.*)")
+  boolean markTableAsDeleted(final TableName table, final Procedure<?> procedure) {
+    return tryCleanupQueue(table, procedure, () -> tableMap, TABLE_QUEUE_KEY_COMPARATOR,
+      locking::getTableLock, tableRunQueue, this::removeTableQueue);
   }
 
   private static boolean isTableProcedure(Procedure<?> proc) {
@@ -410,23 +486,10 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
   }
 
   private void tryCleanupServerQueue(ServerName serverName, Procedure<?> proc) {
-    schedLock();
-    try {
-      int index = getBucketIndex(serverBuckets, serverName.hashCode());
-      ServerQueue node = AvlTree.get(serverBuckets[index], serverName, SERVER_QUEUE_KEY_COMPARATOR);
-      if (node == null) {
-        return;
-      }
-
-      LockAndQueue lock = locking.getServerLock(serverName);
-      if (node.isEmpty() && lock.tryExclusiveLock(proc)) {
-        removeFromRunQueue(serverRunQueue, node,
-          () -> "clean up server queue after " + proc + " completed");
-        removeServerQueue(serverName);
-      }
-    } finally {
-      schedUnlock();
-    }
+    // serverBuckets
+    tryCleanupQueue(serverName, proc,
+      () -> serverBuckets[getBucketIndex(serverBuckets, serverName.hashCode())],
+      SERVER_QUEUE_KEY_COMPARATOR, locking::getServerLock, serverRunQueue, this::removeServerQueue);
   }
 
   private static int getBucketIndex(Object[] buckets, int hashCode) {
@@ -459,23 +522,9 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
     locking.removePeerLock(peerId);
   }
 
-  private void tryCleanupPeerQueue(String peerId, Procedure procedure) {
-    schedLock();
-    try {
-      PeerQueue queue = AvlTree.get(peerMap, peerId, PEER_QUEUE_KEY_COMPARATOR);
-      if (queue == null) {
-        return;
-      }
-
-      final LockAndQueue lock = locking.getPeerLock(peerId);
-      if (queue.isEmpty() && lock.tryExclusiveLock(procedure)) {
-        removeFromRunQueue(peerRunQueue, queue,
-          () -> "clean up peer queue after " + procedure + " completed");
-        removePeerQueue(peerId);
-      }
-    } finally {
-      schedUnlock();
-    }
+  private void tryCleanupPeerQueue(String peerId, Procedure<?> procedure) {
+    tryCleanupQueue(peerId, procedure, () -> peerMap, PEER_QUEUE_KEY_COMPARATOR,
+      locking::getPeerLock, peerRunQueue, this::removePeerQueue);
   }
 
   private static boolean isPeerProcedure(Procedure<?> proc) {
@@ -501,6 +550,35 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
 
   private static boolean isMetaProcedure(Procedure<?> proc) {
     return proc instanceof MetaProcedureInterface;
+  }
+
+  private <T extends Comparable<T>, TNode extends Queue<T>> boolean tryCleanupQueue(T id,
+    Procedure<?> proc, Supplier<TNode> getMap, AvlKeyComparator<TNode> comparator,
+    Function<T, LockAndQueue> getLock, FairQueue<T> runQueue, Consumer<T> removeQueue) {
+    schedLock();
+    try {
+      Queue<T> queue = AvlTree.get(getMap.get(), id, comparator);
+      if (queue == null) {
+        return true;
+      }
+
+      LockAndQueue lock = getLock.apply(id);
+      if (queue.isEmpty() && lock.isWaitingQueueEmpty() && !lock.isLocked()) {
+        // 1. the queue is empty
+        // 2. no procedure is in the lock's waiting queue
+        // 3. no other one holds the lock. It is possible that someone else holds the lock, usually
+        // our parent procedures
+        // If we can meet all the above conditions, it is safe for us to remove the queue
+        removeFromRunQueue(runQueue, queue, () -> "clean up queue after " + proc + " completed");
+        removeQueue.accept(id);
+        return true;
+      } else {
+        return false;
+      }
+
+    } finally {
+      schedUnlock();
+    }
   }
 
   // ============================================================================
@@ -640,37 +718,6 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
     } finally {
       schedUnlock();
     }
-  }
-
-  /**
-   * Tries to remove the queue and the table-lock of the specified table. If there are new
-   * operations pending (e.g. a new create), the remove will not be performed.
-   * @param table     the name of the table that should be marked as deleted
-   * @param procedure the procedure that is removing the table
-   * @return true if deletion succeeded, false otherwise meaning that there are other new operations
-   *         pending for that table (e.g. a new create).
-   */
-  boolean markTableAsDeleted(final TableName table, final Procedure<?> procedure) {
-    schedLock();
-    try {
-      final TableQueue queue = getTableQueue(table);
-      final LockAndQueue tableLock = locking.getTableLock(table);
-      if (queue == null) return true;
-
-      if (queue.isEmpty() && tableLock.tryExclusiveLock(procedure)) {
-        // remove the table from the run-queue and the map
-        if (AvlIterableList.isLinked(queue)) {
-          tableRunQueue.remove(queue);
-        }
-        removeTableQueue(table);
-      } else {
-        // TODO: If there are no create, we can drop all the other ops
-        return false;
-      }
-    } finally {
-      schedUnlock();
-    }
-    return true;
   }
 
   // ============================================================================
@@ -1021,5 +1068,31 @@ public class MasterProcedureScheduler extends AbstractProcedureScheduler {
     } finally {
       schedUnlock();
     }
+  }
+
+  private void serverBucketToString(ToStringBuilder builder, String queueName, Queue<?> queue) {
+    int size = queueSize(queue);
+    if (size != 0) {
+      builder.append(queueName, queue);
+    }
+  }
+
+  @Override
+  public String toString() {
+    ToStringBuilder builder =
+      new ToStringBuilder(this, ToStringStyle.SHORT_PREFIX_STYLE).appendSuper(super.toString());
+    schedLock();
+    try {
+      for (int i = 0; i < serverBuckets.length; i++) {
+        serverBucketToString(builder, "serverBuckets[" + i + "]", serverBuckets[i]);
+      }
+      builder.append("tableMap", tableMap);
+      builder.append("tableWaitingMap", tableProcsWaitingEnqueue);
+      builder.append("peerMap", peerMap);
+      builder.append("metaMap", metaMap);
+    } finally {
+      schedUnlock();
+    }
+    return builder.build();
   }
 }

@@ -333,10 +333,11 @@ public class ProcedureExecutor<TEnvironment> {
   }
 
   private void load(final boolean abortOnCorruption) throws IOException {
-    Preconditions.checkArgument(completed.isEmpty(), "completed not empty");
-    Preconditions.checkArgument(rollbackStack.isEmpty(), "rollback state not empty");
-    Preconditions.checkArgument(procedures.isEmpty(), "procedure map not empty");
-    Preconditions.checkArgument(scheduler.size() == 0, "run queue not empty");
+    Preconditions.checkArgument(completed.isEmpty(), "completed not empty: %s", completed);
+    Preconditions.checkArgument(rollbackStack.isEmpty(), "rollback state not empty: %s",
+      rollbackStack);
+    Preconditions.checkArgument(procedures.isEmpty(), "procedure map not empty: %s", procedures);
+    Preconditions.checkArgument(scheduler.size() == 0, "scheduler queue not empty: %s", scheduler);
 
     store.load(new ProcedureStore.ProcedureLoader() {
       @Override
@@ -502,6 +503,28 @@ public class ProcedureExecutor<TEnvironment> {
   private void pushProceduresAfterLoad(List<Procedure<TEnvironment>> runnableList,
     List<Procedure<TEnvironment>> failedList) {
     failedList.forEach(scheduler::addBack);
+    // Put the procedures which have been executed first
+    // For table procedures, to prevent concurrent modifications, we only allow one procedure to run
+    // for a single table at the same time, this is done via inserting a waiting queue before
+    // actually add the procedure to run queue. So when loading here, we should add the procedures
+    // which have been executed first, otherwise another procedure which was in the waiting queue
+    // before restarting may be added to run queue first and still cause concurrent modifications.
+    // See HBASE-28263 for the reason why we need this
+    runnableList.sort((p1, p2) -> {
+      if (p1.wasExecuted()) {
+        if (p2.wasExecuted()) {
+          return Long.compare(p1.getProcId(), p2.getProcId());
+        } else {
+          return -1;
+        }
+      } else {
+        if (p2.wasExecuted()) {
+          return 1;
+        } else {
+          return Long.compare(p1.getProcId(), p2.getProcId());
+        }
+      }
+    });
     runnableList.forEach(p -> {
       p.afterReplay(getEnvironment());
       if (!p.hasParent()) {
@@ -693,15 +716,11 @@ public class ProcedureExecutor<TEnvironment> {
       worker.awaitTermination();
     }
 
-    // Destroy the Thread Group for the executors
-    // TODO: Fix. #join is not place to destroy resources.
-    try {
-      threadGroup.destroy();
-    } catch (IllegalThreadStateException e) {
-      LOG.error("ThreadGroup {} contains running threads; {}: See STDOUT", this.threadGroup,
-        e.getMessage());
-      // This dumps list of threads on STDOUT.
-      this.threadGroup.list();
+    // log the still active threads, ThreadGroup.destroy is deprecated in JDK17 and it is not
+    // necessary for us to must destroy it here, so we just do a check and log
+    if (threadGroup.activeCount() > 0) {
+      LOG.error("There are still active thread in group {}, see STDOUT", threadGroup);
+      threadGroup.list();
     }
 
     // reset the in-memory state for testing
@@ -1461,7 +1480,7 @@ public class ProcedureExecutor<TEnvironment> {
         LOG.info("Finished " + proc + " in " + StringUtils.humanTimeDiff(proc.elapsedTime()));
         // Finalize the procedure state
         if (proc.getProcId() == rootProcId) {
-          procedureFinished(proc);
+          rootProcedureFinished(proc);
         } else {
           execCompletionCleanup(proc);
         }
@@ -1646,7 +1665,7 @@ public class ProcedureExecutor<TEnvironment> {
       // Finalize the procedure state
       LOG.info("Rolled back {} exec-time={}", rootProc,
         StringUtils.humanTimeDiff(rootProc.elapsedTime()));
-      procedureFinished(rootProc);
+      rootProcedureFinished(rootProc);
     } finally {
       if (lockEntry != null) {
         procExecutionLock.releaseLockEntry(lockEntry);
@@ -1762,6 +1781,7 @@ public class ProcedureExecutor<TEnvironment> {
       reExecute = false;
       procedure.resetPersistence();
       try {
+        procedure.beforeExec(getEnvironment());
         subprocs = procedure.doExecute(getEnvironment());
         if (subprocs != null && subprocs.length == 0) {
           subprocs = null;
@@ -1771,11 +1791,13 @@ public class ProcedureExecutor<TEnvironment> {
         suspended = true;
       } catch (ProcedureYieldException e) {
         LOG.trace("Yield {}", procedure, e);
+        procedure.afterExec(getEnvironment());
         yieldProcedure(procedure);
         return;
       } catch (InterruptedException e) {
         LOG.trace("Yield interrupt {}", procedure, e);
         handleInterruptedException(procedure, e);
+        procedure.afterExec(getEnvironment());
         yieldProcedure(procedure);
         return;
       } catch (Throwable e) {
@@ -1847,6 +1869,7 @@ public class ProcedureExecutor<TEnvironment> {
           updateStoreOnExec(procStack, procedure, subprocs);
         }
       }
+      procedure.afterExec(getEnvironment());
 
       // if the store is not running we are aborting
       if (!store.isRunning()) {
@@ -2008,11 +2031,15 @@ public class ProcedureExecutor<TEnvironment> {
       proc.completionCleanup(env);
     } catch (Throwable e) {
       // Catch NullPointerExceptions or similar errors...
-      LOG.error("CODE-BUG: uncatched runtime exception for procedure: " + proc, e);
+      LOG.error("CODE-BUG: uncaught runtime exception for procedure: " + proc, e);
     }
+
+    // call schedulers completion cleanup, we have some special clean up logic in this method so if
+    // it throws any exceptions, we can not just ignore it like the above procedure's cleanup
+    scheduler.completionCleanup(proc);
   }
 
-  private void procedureFinished(Procedure<TEnvironment> proc) {
+  private void rootProcedureFinished(Procedure<TEnvironment> proc) {
     // call the procedure completion cleanup handler
     execCompletionCleanup(proc);
 
@@ -2026,14 +2053,6 @@ public class ProcedureExecutor<TEnvironment> {
     completed.put(proc.getProcId(), retainer);
     rollbackStack.remove(proc.getProcId());
     procedures.remove(proc.getProcId());
-
-    // call the runnableSet completion cleanup handler
-    try {
-      scheduler.completionCleanup(proc);
-    } catch (Throwable e) {
-      // Catch NullPointerExceptions or similar errors...
-      LOG.error("CODE-BUG: uncatched runtime exception for completion cleanup: {}", proc, e);
-    }
 
     // Notify the listeners
     sendProcedureFinishedNotification(proc.getProcId());

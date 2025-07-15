@@ -26,6 +26,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ArrayBackedTag;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellComparator;
+import org.apache.hadoop.hbase.ExtendedCell;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValueUtil;
 import org.apache.hadoop.hbase.Tag;
@@ -36,8 +37,8 @@ import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
 import org.apache.hadoop.hbase.security.visibility.CellVisibility;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Strings;
 import org.apache.hadoop.mapreduce.Reducer;
-import org.apache.hadoop.util.StringUtils;
 import org.apache.yetus.audience.InterfaceAudience;
 
 /**
@@ -100,7 +101,7 @@ public class PutSortReducer
           throw new IOException("Invalid visibility expression found in mutation " + p, e);
         }
         for (List<Cell> cells : p.getFamilyCellMap().values()) {
-          for (Cell cell : cells) {
+          for (ExtendedCell cell : (List<ExtendedCell>) (List) cells) {
             // Creating the KV which needs to be directly written to HFiles. Using the Facade
             // KVCreator for creation of kvs.
             KeyValue kv = null;
@@ -121,7 +122,7 @@ public class PutSortReducer
         }
       }
       context.setStatus("Read " + map.size() + " entries of " + map.getClass() + "("
-        + StringUtils.humanReadableInt(curSize) + ")");
+        + Strings.humanReadableInt(curSize) + ")");
       int index = 0;
       for (KeyValue kv : map) {
         context.write(row, kv);

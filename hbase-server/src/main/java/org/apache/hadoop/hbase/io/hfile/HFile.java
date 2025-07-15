@@ -32,14 +32,15 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
-import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellComparator;
+import org.apache.hadoop.hbase.ExtendedCell;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
 import org.apache.hadoop.hbase.io.MetricsIO;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 import org.apache.hadoop.hbase.io.hfile.ReaderContext.ReaderType;
+import org.apache.hadoop.hbase.ipc.RpcServer;
 import org.apache.hadoop.hbase.regionserver.CellSink;
 import org.apache.hadoop.hbase.regionserver.ShipperListener;
 import org.apache.hadoop.hbase.util.BloomFilterWriter;
@@ -187,11 +188,15 @@ public final class HFile {
     return CHECKSUM_FAILURES.sum();
   }
 
-  public static final void updateReadLatency(long latencyMillis, boolean pread) {
+  public static final void updateReadLatency(long latencyMillis, boolean pread, boolean tooSlow) {
+    RpcServer.getCurrentCall().ifPresent(call -> call.updateFsReadTime(latencyMillis));
     if (pread) {
       MetricsIO.getInstance().updateFsPreadTime(latencyMillis);
     } else {
       MetricsIO.getInstance().updateFsReadTime(latencyMillis);
+    }
+    if (tooSlow) {
+      MetricsIO.getInstance().incrSlowFsRead();
     }
   }
 
@@ -390,15 +395,15 @@ public final class HFile {
 
     HFileBlock getMetaBlock(String metaBlockName, boolean cacheBlock) throws IOException;
 
-    Optional<Cell> getLastKey();
+    Optional<ExtendedCell> getLastKey();
 
-    Optional<Cell> midKey() throws IOException;
+    Optional<ExtendedCell> midKey() throws IOException;
 
     long length();
 
     long getEntries();
 
-    Optional<Cell> getFirstKey();
+    Optional<ExtendedCell> getFirstKey();
 
     long indexSize();
 
@@ -451,6 +456,8 @@ public final class HFile {
     HFileBlock.FSReader getUncachedBlockReader();
 
     boolean prefetchComplete();
+
+    boolean prefetchStarted();
 
     /**
      * To close the stream's socket. Note: This can be concurrently called from multiple threads and

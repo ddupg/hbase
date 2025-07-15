@@ -134,6 +134,7 @@ import org.apache.hadoop.hbase.io.hfile.HFile;
 import org.apache.hadoop.hbase.io.hfile.bucket.BucketCache;
 import org.apache.hadoop.hbase.io.util.MemorySizeUtil;
 import org.apache.hadoop.hbase.ipc.CoprocessorRpcUtils;
+import org.apache.hadoop.hbase.ipc.DecommissionedHostRejectedException;
 import org.apache.hadoop.hbase.ipc.NettyRpcClientConfigHelper;
 import org.apache.hadoop.hbase.ipc.RpcClient;
 import org.apache.hadoop.hbase.ipc.RpcClientFactory;
@@ -615,6 +616,9 @@ public class HRegionServer extends Thread
    * Chore that creates replication marker rows.
    */
   private ReplicationMarkerChore replicationMarkerChore;
+
+  // A timer submit requests to the PrefetchExecutor
+  private PrefetchExecutorNotifier prefetchExecutorNotifier;
 
   /**
    * Starts a HRegionServer at the default location.
@@ -1701,7 +1705,7 @@ public class HRegionServer extends Thread
           if (!isHostnameConsist) {
             String msg = "Master passed us a different hostname to use; was="
               + (StringUtils.isBlank(useThisHostnameInstead)
-                ? rpcServices.getSocketAddress().getHostName()
+                ? expectedHostName
                 : this.useThisHostnameInstead)
               + ", but now=" + hostnameFromMasterPOV;
             LOG.error(msg);
@@ -1992,13 +1996,12 @@ public class HRegionServer extends Thread
 
     @Override
     protected void chore() {
-      for (Region r : this.instance.onlineRegions.values()) {
+      for (HRegion hr : this.instance.onlineRegions.values()) {
         // If region is read only or compaction is disabled at table level, there's no need to
         // iterate through region's stores
-        if (r == null || r.isReadOnly() || !r.getTableDescriptor().isCompactionEnabled()) {
+        if (hr == null || hr.isReadOnly() || !hr.getTableDescriptor().isCompactionEnabled()) {
           continue;
         }
-        HRegion hr = (HRegion) r;
         for (HStore s : hr.stores.values()) {
           try {
             long multiplier = s.getCompactionCheckMultiplier();
@@ -2026,7 +2029,7 @@ public class HRegionServer extends Thread
               }
             }
           } catch (IOException e) {
-            LOG.warn("Failed major compaction check on " + r, e);
+            LOG.warn("Failed major compaction check on " + hr, e);
           }
         }
       }
@@ -2253,6 +2256,11 @@ public class HRegionServer extends Thread
       conf.getInt("hbase.regionserver.executor.flush.operations.threads", 3);
     executorService.startExecutorService(executorService.new ExecutorConfig()
       .setExecutorType(ExecutorType.RS_FLUSH_OPERATIONS).setCorePoolSize(rsFlushOperationThreads));
+    final int rsRefreshQuotasThreads =
+      conf.getInt("hbase.regionserver.executor.refresh.quotas.threads", 1);
+    executorService.startExecutorService(
+      executorService.new ExecutorConfig().setExecutorType(ExecutorType.RS_RELOAD_QUOTAS_OPERATIONS)
+        .setCorePoolSize(rsRefreshQuotasThreads));
 
     Threads.setDaemonThreadRunning(this.walRoller, getName() + ".logRoller",
       uncaughtExceptionHandler);
@@ -2332,6 +2340,9 @@ public class HRegionServer extends Thread
     // Compaction thread
     this.compactSplitThread = new CompactSplit(this);
 
+    // Prefetch Notifier
+    this.prefetchExecutorNotifier = new PrefetchExecutorNotifier(conf);
+
     // Background thread to check for compactions; needed if region has not gotten updates
     // in a while. It will take care of not checking too frequently on store-by-store basis.
     this.compactionChecker = new CompactionChecker(this, this.compactionCheckFrequency, this);
@@ -2365,6 +2376,7 @@ public class HRegionServer extends Thread
 
     // Setup the Quota Manager
     rsQuotaManager = new RegionServerRpcQuotaManager(this);
+    configurationManager.registerObserver(rsQuotaManager);
     rsSpaceQuotaManager = new RegionServerSpaceQuotaManager(this);
 
     if (QuotaUtil.isQuotaEnabled(conf)) {
@@ -2424,6 +2436,7 @@ public class HRegionServer extends Thread
     configurationManager.registerObserver(this.compactSplitThread);
     configurationManager.registerObserver(this.cacheFlusher);
     configurationManager.registerObserver(this.rpcServices);
+    configurationManager.registerObserver(this.prefetchExecutorNotifier);
     configurationManager.registerObserver(this);
   }
 
@@ -2435,9 +2448,11 @@ public class HRegionServer extends Thread
       this.conf.getInt(HConstants.REGIONSERVER_INFO_PORT, HConstants.DEFAULT_REGIONSERVER_INFOPORT);
     String addr = this.conf.get("hbase.regionserver.info.bindAddress", "0.0.0.0");
 
+    boolean isMaster = false;
     if (this instanceof HMaster) {
       port = conf.getInt(HConstants.MASTER_INFO_PORT, HConstants.DEFAULT_MASTER_INFOPORT);
       addr = this.conf.get("hbase.master.info.bindAddress", "0.0.0.0");
+      isMaster = true;
     }
     // -1 is for disabling info server
     if (port < 0) {
@@ -2447,7 +2462,7 @@ public class HRegionServer extends Thread
     if (!Addressing.isLocalAddress(InetAddress.getByName(addr))) {
       String msg = "Failed to start http info server. Address " + addr
         + " does not belong to this host. Correct configuration parameter: "
-        + "hbase.regionserver.info.bindAddress";
+        + (isMaster ? "hbase.master.info.bindAddress" : "hbase.regionserver.info.bindAddress");
       LOG.error(msg);
       throw new IOException(msg);
     }
@@ -2589,6 +2604,7 @@ public class HRegionServer extends Thread
     HRegion r = context.getRegion();
     long openProcId = context.getOpenProcId();
     long masterSystemTime = context.getMasterSystemTime();
+    long initiatingMasterActiveTime = context.getInitiatingMasterActiveTime();
     rpcServices.checkOpen();
     LOG.info("Post open deploy tasks for {}, pid={}, masterSystemTime={}",
       r.getRegionInfo().getRegionNameAsString(), openProcId, masterSystemTime);
@@ -2609,7 +2625,7 @@ public class HRegionServer extends Thread
     // Notify master
     if (
       !reportRegionStateTransition(new RegionStateTransitionContext(TransitionCode.OPENED,
-        openSeqNum, openProcId, masterSystemTime, r.getRegionInfo()))
+        openSeqNum, openProcId, masterSystemTime, r.getRegionInfo(), initiatingMasterActiveTime))
     ) {
       throw new IOException(
         "Failed to report opened region to master: " + r.getRegionInfo().getRegionNameAsString());
@@ -2670,6 +2686,7 @@ public class HRegionServer extends Thread
     for (long procId : procIds) {
       transition.addProcId(procId);
     }
+    transition.setInitiatingMasterActiveTime(context.getInitiatingMasterActiveTime());
 
     return builder.build();
   }
@@ -3077,6 +3094,11 @@ public class HRegionServer extends Thread
       IOException ioe = ProtobufUtil.getRemoteException(se);
       if (ioe instanceof ClockOutOfSyncException) {
         LOG.error(HBaseMarkers.FATAL, "Master rejected startup because clock is out of sync", ioe);
+        // Re-throw IOE will cause RS to abort
+        throw ioe;
+      } else if (ioe instanceof DecommissionedHostRejectedException) {
+        LOG.error(HBaseMarkers.FATAL,
+          "Master rejected startup because the host is considered decommissioned", ioe);
         // Re-throw IOE will cause RS to abort
         throw ioe;
       } else if (ioe instanceof ServerNotRunningYetException) {
@@ -4068,12 +4090,15 @@ public class HRegionServer extends Thread
       this.rpcServices, this.rpcServices, new RegionServerRegistry(this));
   }
 
-  void executeProcedure(long procId, RSProcedureCallable callable) {
-    executorService.submit(new RSProcedureHandler(this, procId, callable));
+  void executeProcedure(long procId, long initiatingMasterActiveTime,
+    RSProcedureCallable callable) {
+    executorService
+      .submit(new RSProcedureHandler(this, procId, initiatingMasterActiveTime, callable));
   }
 
-  public void remoteProcedureComplete(long procId, Throwable error) {
-    procedureResultReporter.complete(procId, error);
+  public void remoteProcedureComplete(long procId, long initiatingMasterActiveTime,
+    Throwable error) {
+    procedureResultReporter.complete(procId, initiatingMasterActiveTime, error);
   }
 
   void reportProcedureDone(ReportProcedureDoneRequest request) throws IOException {

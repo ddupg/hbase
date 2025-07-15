@@ -24,6 +24,7 @@ import io.opentelemetry.context.Scope;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -96,10 +97,12 @@ public abstract class ServerCall<T extends ServerRpcConnection> implements RpcCa
 
   protected final User user;
   protected final InetAddress remoteAddress;
+  protected final X509Certificate[] clientCertificateChain;
   protected RpcCallback rpcCallback;
 
   private long responseCellSize = 0;
   private long responseBlockSize = 0;
+  private long fsReadTimeMillis = 0;
   // cumulative size of serialized exceptions
   private long exceptionSize = 0;
   private final boolean retryImmediatelySupported;
@@ -135,9 +138,11 @@ public abstract class ServerCall<T extends ServerRpcConnection> implements RpcCa
     if (connection != null) {
       this.user = connection.user;
       this.retryImmediatelySupported = connection.retryImmediatelySupported;
+      this.clientCertificateChain = connection.clientCertificateChain;
     } else {
       this.user = null;
       this.retryImmediatelySupported = false;
+      this.clientCertificateChain = null;
     }
     this.remoteAddress = remoteAddress;
     this.timeout = timeout;
@@ -499,6 +504,11 @@ public abstract class ServerCall<T extends ServerRpcConnection> implements RpcCa
   }
 
   @Override
+  public Optional<X509Certificate[]> getClientCertificateChain() {
+    return Optional.ofNullable(clientCertificateChain);
+  }
+
+  @Override
   public InetAddress getRemoteAddress() {
     return remoteAddress;
   }
@@ -572,5 +582,15 @@ public abstract class ServerCall<T extends ServerRpcConnection> implements RpcCa
       allowedOnPath = ".*/src/test/.*")
   public synchronized RpcCallback getCallBack() {
     return this.rpcCallback;
+  }
+
+  @Override
+  public void updateFsReadTime(long latencyMillis) {
+    fsReadTimeMillis += latencyMillis;
+  }
+
+  @Override
+  public long getFsReadTime() {
+    return fsReadTimeMillis;
   }
 }

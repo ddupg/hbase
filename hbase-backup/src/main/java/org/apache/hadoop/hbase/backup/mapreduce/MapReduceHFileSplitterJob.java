@@ -34,6 +34,7 @@ import org.apache.hadoop.hbase.mapreduce.CellSortReducer;
 import org.apache.hadoop.hbase.mapreduce.HFileInputFormat;
 import org.apache.hadoop.hbase.mapreduce.HFileOutputFormat2;
 import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil;
+import org.apache.hadoop.hbase.snapshot.SnapshotRegionLocator;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.MapReduceExtendedCell;
 import org.apache.hadoop.io.NullWritable;
@@ -99,6 +100,10 @@ public class MapReduceHFileSplitterJob extends Configured implements Tool {
     conf.set(FileInputFormat.INPUT_DIR, inputDirs);
     Job job = Job.getInstance(conf,
       conf.get(JOB_NAME_CONF_KEY, NAME + "_" + EnvironmentEdgeManager.currentTime()));
+    // MapReduceHFileSplitter needs ExtendedCellSerialization so that sequenceId can be propagated
+    // when sorting cells in CellSortReducer
+    job.getConfiguration().setBoolean(HFileOutputFormat2.EXTENDED_CELL_SERIALIZATION_ENABLED_KEY,
+      true);
     job.setJarByClass(MapReduceHFileSplitterJob.class);
     job.setInputFormatClass(HFileInputFormat.class);
     job.setMapOutputKeyClass(ImmutableBytesWritable.class);
@@ -113,7 +118,7 @@ public class MapReduceHFileSplitterJob extends Configured implements Tool {
       job.setMapOutputValueClass(MapReduceExtendedCell.class);
       try (Connection conn = ConnectionFactory.createConnection(conf);
         Table table = conn.getTable(tableName);
-        RegionLocator regionLocator = conn.getRegionLocator(tableName)) {
+        RegionLocator regionLocator = getRegionLocator(conf, conn, tableName)) {
         HFileOutputFormat2.configureIncrementalLoad(job, table.getDescriptor(), regionLocator);
       }
       LOG.debug("success configuring load incremental job");
@@ -165,5 +170,14 @@ public class MapReduceHFileSplitterJob extends Configured implements Tool {
     Job job = createSubmittableJob(args);
     int result = job.waitForCompletion(true) ? 0 : 1;
     return result;
+  }
+
+  private static RegionLocator getRegionLocator(Configuration conf, Connection conn,
+    TableName table) throws IOException {
+    if (SnapshotRegionLocator.shouldUseSnapshotRegionLocator(conf, table)) {
+      return SnapshotRegionLocator.create(conf, table);
+    }
+
+    return conn.getRegionLocator(table);
   }
 }

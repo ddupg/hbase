@@ -22,6 +22,7 @@ import static org.apache.hadoop.hbase.client.MetricsConnection.CLIENT_SIDE_METRI
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseClassTestRule;
@@ -44,6 +45,7 @@ import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
+import org.junit.function.ThrowingRunnable;
 
 import org.apache.hbase.thirdparty.com.google.common.io.Closeables;
 import org.apache.hbase.thirdparty.com.google.protobuf.RpcController;
@@ -161,8 +163,9 @@ public class TestClientOperationTimeout {
   }
 
   /**
-   * Tests that a batch mutate and batch get on a table throws {@link SocketTimeoutException} when
-   * the operation takes longer than 'hbase.client.operation.timeout'.
+   * Tests that a batch mutate and batch get on a table throws {@link SocketTimeoutException} or
+   * {@link OperationTimeoutExceededException} when the operation takes longer than
+   * 'hbase.client.operation.timeout'.
    */
   @Test
   public void testMultiTimeout() {
@@ -174,12 +177,7 @@ public class TestClientOperationTimeout {
     List<Put> puts = new ArrayList<>();
     puts.add(put1);
     puts.add(put2);
-    try {
-      TABLE.batch(puts, new Object[2]);
-      Assert.fail("should not reach here");
-    } catch (Exception e) {
-      Assert.assertTrue(e instanceof SocketTimeoutException);
-    }
+    assertMultiException(() -> TABLE.batch(puts, new Object[2]));
 
     Get get1 = new Get(ROW);
     get1.addColumn(FAMILY, QUALIFIER);
@@ -189,11 +187,27 @@ public class TestClientOperationTimeout {
     List<Get> gets = new ArrayList<>();
     gets.add(get1);
     gets.add(get2);
-    try {
-      TABLE.batch(gets, new Object[2]);
-      Assert.fail("should not reach here");
-    } catch (Exception e) {
-      Assert.assertTrue(e instanceof SocketTimeoutException);
+    assertMultiException(() -> TABLE.batch(gets, new Object[2]));
+  }
+
+  /**
+   * AsyncProcess has an overall waitUntilDone with a timeout, and if all callables dont finish by
+   * then it throws a SocketTimeoutException. The callables themselves also try to honor the
+   * operation timeout and result in OperationTimeoutExceededException (wrapped in
+   * RetriesExhausted). The latter is the more user-friendly exception because it contains details
+   * about which server has issues, etc. For now we need to account for both because it's sort of a
+   * race to see which timeout exceeds first. Maybe we can replace the waitUntilDone behavior with
+   * an interrupt in the future so we can further unify.
+   */
+  private void assertMultiException(ThrowingRunnable runnable) {
+    IOException e = Assert.assertThrows(IOException.class, runnable);
+    if (e instanceof SocketTimeoutException) {
+      return;
+    }
+    Assert.assertTrue("Expected SocketTimeoutException or RetriesExhaustedWithDetailsException"
+      + " but was " + e.getClass(), e instanceof RetriesExhaustedWithDetailsException);
+    for (Throwable cause : ((RetriesExhaustedWithDetailsException) e).getCauses()) {
+      Assert.assertEquals(OperationTimeoutExceededException.class, cause.getClass());
     }
   }
 
@@ -305,6 +319,71 @@ public class TestClientOperationTimeout {
       }
     } catch (IOException e) {
       throw new RuntimeException(e);
+    }
+  }
+
+  /**
+   * Test that for a batch operation where region location resolution fails for the first action in
+   * the batch and consumes the entire operation timeout, that the location error is preserved for
+   * the first action and that the rest of the batch is failed fast with
+   * OperationTimeoutExceededException , this also (indirectly) tests that the action counter is
+   * decremented properly for all actions, see last catch block
+   */
+  @Test
+  public void testMultiOperationTimeoutWithLocationError()
+    throws IOException, InterruptedException {
+    // Need meta delay > meta scan timeout > operation timeout (with no retries) so that the
+    // meta scan for resolving region location for the first action times out after the operation
+    // timeout has been exceeded leaving no time to attempt region location resolution for any
+    // other actions remaining in the batch
+    int operationTimeout = 100;
+    int metaScanTimeout = 150;
+    DELAY_META_SCAN = 200;
+
+    Configuration conf = new Configuration(UTIL.getConfiguration());
+    conf.setLong(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT, operationTimeout);
+    conf.setLong(ConnectionConfiguration.HBASE_CLIENT_META_SCANNER_TIMEOUT, metaScanTimeout);
+    conf.setLong(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 0);
+
+    try (Connection specialConnection = ConnectionFactory.createConnection(conf);
+      Table specialTable = specialConnection.getTable(TABLE_NAME)) {
+
+      // Region location resolution for first action should fail due to meta scan timeout and cause
+      // the batch to exceed the operation timeout, second and third action should then be failed
+      // fast with OperationTimeoutExceededException
+      Get firstAction = new Get(Bytes.toBytes(0)).addColumn(FAMILY, QUALIFIER);
+      Get secondAction = firstAction;
+      Get thirdAction = new Get(Bytes.toBytes(1)).addColumn(FAMILY, QUALIFIER);
+      List<Get> gets = Arrays.asList(firstAction, secondAction, thirdAction);
+      try {
+        specialTable.batch(gets, new Object[3]);
+        Assert.fail("Should not reach here");
+      } catch (RetriesExhaustedWithDetailsException exception) {
+        byte[] firstExceptionRow = exception.getRow(0).getRow();
+        Assert.assertEquals(firstAction.getRow(), firstExceptionRow);
+
+        // CallTimeout comes from the scan timeout to meta table in locateRegionInMeta
+        Throwable firstActionCause = exception.getCause(0);
+        Assert.assertTrue(firstActionCause instanceof RetriesExhaustedException);
+        Assert.assertTrue(firstActionCause.getCause() instanceof CallTimeoutException);
+
+        byte[] secondExceptionRow = exception.getRow(1).getRow();
+        Assert.assertEquals(secondAction.getRow(), secondExceptionRow);
+
+        Throwable secondActionCause = exception.getCause(1);
+        Assert.assertTrue(secondActionCause instanceof OperationTimeoutExceededException);
+
+        byte[] thirdExceptionRow = exception.getRow(2).getRow();
+        Assert.assertEquals(thirdAction.getRow(), thirdExceptionRow);
+
+        Throwable thirdActionCause = exception.getCause(2);
+        Assert.assertTrue(thirdActionCause instanceof OperationTimeoutExceededException);
+      }
+    } catch (SocketTimeoutException ste) {
+      if (ste.getMessage().contains("time out before the actionsInProgress changed to zero")) {
+        Assert.fail("Not all actions had action counter decremented: " + ste);
+      }
+      throw ste;
     }
   }
 

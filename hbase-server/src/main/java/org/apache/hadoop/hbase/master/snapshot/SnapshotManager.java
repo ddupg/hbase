@@ -722,12 +722,27 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
       .submitProcedure(new MasterProcedureUtil.NonceProcedureRunnable(master, nonceGroup, nonce) {
         @Override
         protected void run() throws IOException {
+          TableDescriptor tableDescriptor =
+            master.getTableDescriptors().get(TableName.valueOf(snapshot.getTable()));
+          MasterCoprocessorHost cpHost = getMaster().getMasterCoprocessorHost();
+          User user = RpcServer.getRequestUser().orElse(null);
+          org.apache.hadoop.hbase.client.SnapshotDescription snapshotDesc =
+            ProtobufUtil.createSnapshotDesc(snapshot);
+
+          if (cpHost != null) {
+            cpHost.preSnapshot(snapshotDesc, tableDescriptor, user);
+          }
+
           sanityCheckBeforeSnapshot(snapshot, false);
 
           long procId = submitProcedure(new SnapshotProcedure(
             getMaster().getMasterProcedureExecutor().getEnvironment(), snapshot));
 
           getMaster().getSnapshotManager().registerSnapshotProcedure(snapshot, procId);
+
+          if (cpHost != null) {
+            cpHost.postSnapshot(snapshotDesc, tableDescriptor, user);
+          }
         }
 
         @Override
@@ -1082,9 +1097,10 @@ public class SnapshotManager extends MasterProcedureManager implements Stoppable
     }
 
     try {
+      TableDescriptor oldDescriptor = master.getTableDescriptors().get(tableName);
       long procId = master.getMasterProcedureExecutor().submitProcedure(
         new RestoreSnapshotProcedure(master.getMasterProcedureExecutor().getEnvironment(),
-          tableDescriptor, snapshot, restoreAcl),
+          oldDescriptor, tableDescriptor, snapshot, restoreAcl),
         nonceKey);
       this.restoreTableToProcIdMap.put(tableName, procId);
       return procId;

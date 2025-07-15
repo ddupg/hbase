@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.master.procedure;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.MetaTableAccessor;
@@ -41,9 +42,12 @@ import org.apache.hadoop.hbase.master.MasterFileSystem;
 import org.apache.hadoop.hbase.mob.MobConstants;
 import org.apache.hadoop.hbase.mob.MobUtils;
 import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;
+import org.apache.hadoop.hbase.procedure2.ProcedureSuspendedException;
+import org.apache.hadoop.hbase.procedure2.ProcedureUtil;
 import org.apache.hadoop.hbase.util.CommonFSUtils;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSUtils;
+import org.apache.hadoop.hbase.util.RetryCounter;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,6 +58,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos;
 import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.DeleteTableState;
+import org.apache.hadoop.hbase.shaded.protobuf.generated.ProcedureProtos;
 
 @InterfaceAudience.Private
 public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<DeleteTableState> {
@@ -61,6 +66,7 @@ public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<Del
 
   private List<RegionInfo> regions;
   private TableName tableName;
+  private RetryCounter retryCounter;
 
   public DeleteTableProcedure() {
     // Required by the Procedure framework to create the procedure on replay
@@ -79,7 +85,7 @@ public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<Del
 
   @Override
   protected Flow executeFromState(final MasterProcedureEnv env, DeleteTableState state)
-    throws InterruptedException {
+    throws InterruptedException, ProcedureSuspendedException {
     if (LOG.isTraceEnabled()) {
       LOG.trace(this + " execute state=" + state);
     }
@@ -124,6 +130,7 @@ public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<Del
           break;
         case DELETE_TABLE_POST_OPERATION:
           postDelete(env);
+          retryCounter = null;
           LOG.debug("Finished {}", this);
           return Flow.NO_MORE_STATE;
         default:
@@ -133,10 +140,24 @@ public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<Del
       if (isRollbackSupported(state)) {
         setFailure("master-delete-table", e);
       } else {
-        LOG.warn("Retriable error trying to delete table=" + getTableName() + " state=" + state, e);
+        if (retryCounter == null) {
+          retryCounter = ProcedureUtil.createRetryCounter(env.getMasterConfiguration());
+        }
+        long backoff = retryCounter.getBackoffTimeAndIncrementAttempts();
+        LOG.warn("Retriable error trying to delete table={},state={},suspend {}secs.",
+          getTableName(), state, backoff / 1000, e);
+        throw suspend(Math.toIntExact(backoff), true);
       }
     }
+    retryCounter = null;
     return Flow.HAS_MORE_STATE;
+  }
+
+  @Override
+  protected synchronized boolean setTimeoutFailure(MasterProcedureEnv env) {
+    setState(ProcedureProtos.ProcedureState.RUNNABLE);
+    env.getProcedureScheduler().addFront(this);
+    return false;
   }
 
   @Override
@@ -269,6 +290,7 @@ public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<Del
     final List<RegionInfo> regions, final boolean archive) throws IOException {
     final MasterFileSystem mfs = env.getMasterServices().getMasterFileSystem();
     final FileSystem fs = mfs.getFileSystem();
+    final Configuration conf = env.getMasterConfiguration();
 
     final Path tableDir = CommonFSUtils.getTableDir(mfs.getRootDir(), tableName);
 
@@ -287,8 +309,7 @@ public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<Del
             }
           }
         }
-        HFileArchiver.archiveRegions(env.getMasterConfiguration(), fs, mfs.getRootDir(), tableDir,
-          regionDirList);
+        HFileArchiver.archiveRegions(conf, fs, mfs.getRootDir(), tableDir, regionDirList);
         if (!regionDirList.isEmpty()) {
           LOG.debug("Archived {} regions", tableName);
         }
@@ -299,7 +320,7 @@ public class DeleteTableProcedure extends AbstractStateMachineTableProcedure<Del
         CommonFSUtils.getTableDir(new Path(mfs.getRootDir(), MobConstants.MOB_DIR_NAME), tableName);
       Path regionDir = new Path(mobTableDir, MobUtils.getMobRegionInfo(tableName).getEncodedName());
       if (fs.exists(regionDir)) {
-        HFileArchiver.archiveRegion(fs, mfs.getRootDir(), mobTableDir, regionDir);
+        HFileArchiver.archiveRegion(conf, fs, mfs.getRootDir(), mobTableDir, regionDir);
       }
 
       // Delete table directory from FS

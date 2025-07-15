@@ -101,8 +101,8 @@
           <artifactId>jetty-util-ajax</artifactId>
         </exclusion>
         <exclusion>
-          <groupId>org.glassfish</groupId>
-          <artifactId>javax.el</artifactId>
+          <groupId>org.apache.tomcat</groupId>
+          <artifactId>tomcat-jasper</artifactId>
         </exclusion>
         <exclusion>
           <groupId>org.eclipse.jetty</groupId>
@@ -356,38 +356,6 @@
             <exclusion>
               <groupId>javax.ws.rs</groupId>
               <artifactId>jsr311-api</artifactId>
-            </exclusion>
-          </exclusions>
-        </dependency>
-        <dependency>
-          <groupId>org.codehaus.jackson</groupId>
-          <artifactId>jackson-jaxrs</artifactId>
-          <version>1.9.13</version>
-          <scope>provided</scope>
-          <exclusions>
-            <exclusion>
-              <groupId>org.codehaus.jackson</groupId>
-              <artifactId>jackson-mapper-asl</artifactId>
-            </exclusion>
-            <exclusion>
-              <groupId>org.codehaus.jackson</groupId>
-              <artifactId>jackson-core-asl</artifactId>
-            </exclusion>
-          </exclusions>
-        </dependency>
-        <dependency>
-          <groupId>org.codehaus.jackson</groupId>
-          <artifactId>jackson-xc</artifactId>
-          <version>1.9.13</version>
-          <scope>provided</scope>
-          <exclusions>
-            <exclusion>
-              <groupId>org.codehaus.jackson</groupId>
-              <artifactId>jackson-mapper-asl</artifactId>
-            </exclusion>
-            <exclusion>
-              <groupId>org.codehaus.jackson</groupId>
-              <artifactId>jackson-core-asl</artifactId>
             </exclusion>
           </exclusions>
         </dependency>

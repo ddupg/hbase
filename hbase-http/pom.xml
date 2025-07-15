@@ -101,18 +101,8 @@
     </dependency>
     <!-- Test dependencies -->
     <dependency>
-      <groupId>org.apache.kerby</groupId>
-      <artifactId>kerb-simplekdc</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
       <groupId>org.bouncycastle</groupId>
       <artifactId>bcprov-jdk18on</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.kerby</groupId>
-      <artifactId>kerb-core</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -381,6 +371,11 @@
           <artifactId>hadoop-minikdc</artifactId>
           <scope>test</scope>
         </dependency>
+        <dependency>
+          <groupId>org.apache.kerby</groupId>
+          <artifactId>kerb-simplekdc</artifactId>
+          <scope>test</scope>
+        </dependency>
       </dependencies>
       <build>
         <plugins>
@@ -402,6 +397,21 @@
                 </configuration>
               </execution>
             </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <configuration>
+              <!--
+                Below tests fail with hadoop 2 due to test dependency versioning issues.  Hence, skip LDAP tests for Hadoop 2,
+                see HBASE-28368 for more details!
+              -->
+              <testExcludes>
+                <testExclude>**/org/apache/hadoop/hbase/http/TestLdapHttpServer**</testExclude>
+                <testExclude>**/org/apache/hadoop/hbase/http/LdapServerTestBase**</testExclude>
+                <testExclude>**/org/apache/hadoop/hbase/http/TestLdapAdminACL**</testExclude>
+              </testExcludes>
+            </configuration>
           </plugin>
         </plugins>
       </build>
@@ -450,6 +460,60 @@
           <groupId>org.apache.hadoop</groupId>
           <artifactId>hadoop-minikdc</artifactId>
           <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.directory.server</groupId>
+          <artifactId>apacheds-core</artifactId>
+          <version>${apacheds.version}</version>
+          <scope>test</scope>
+          <exclusions>
+            <exclusion>
+              <groupId>org.bouncycastle</groupId>
+              <artifactId>bcprov-jdk15on</artifactId>
+            </exclusion>
+          </exclusions>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.directory.server</groupId>
+          <artifactId>apacheds-protocol-ldap</artifactId>
+          <version>${apacheds.version}</version>
+          <scope>test</scope>
+          <exclusions>
+            <exclusion>
+              <groupId>org.bouncycastle</groupId>
+              <artifactId>bcprov-jdk15on</artifactId>
+            </exclusion>
+          </exclusions>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.directory.server</groupId>
+          <artifactId>apacheds-ldif-partition</artifactId>
+          <version>${apacheds.version}</version>
+          <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.directory.api</groupId>
+          <artifactId>api-ldap-codec-core</artifactId>
+          <version>${ldap-api.version}</version>
+          <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.directory.api</groupId>
+          <artifactId>api-ldap-model</artifactId>
+          <version>${ldap-api.version}</version>
+          <scope>test</scope>
+        </dependency>
+        <dependency>
+          <groupId>org.apache.directory.server</groupId>
+          <artifactId>apacheds-server-integ</artifactId>
+          <version>${apacheds.version}</version>
+          <scope>test</scope>
+          <exclusions>
+            <exclusion>
+              <groupId>log4j</groupId>
+              <artifactId>log4j</artifactId>
+            </exclusion>
+          </exclusions>
         </dependency>
       </dependencies>
       <build>

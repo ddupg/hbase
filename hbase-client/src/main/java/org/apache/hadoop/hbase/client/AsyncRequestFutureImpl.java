@@ -45,6 +45,7 @@ import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.backoff.ServerStatistics;
 import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.exceptions.ClientExceptionsUtil;
+import org.apache.hadoop.hbase.quotas.RpcThrottlingException;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -218,13 +219,14 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
         } catch (IOException e) {
           // The service itself failed . It may be an error coming from the communication
           // layer, but, as well, a functional error raised by the server.
-          receiveGlobalFailure(multiAction, server, numAttempt, e, true);
+
+          receiveGlobalFailure(multiAction, server, numAttempt, e);
           return;
         } catch (Throwable t) {
           // This should not happen. Let's log & retry anyway.
           LOG.error("id=" + asyncProcess.id + ", caught throwable. Unexpected."
             + " Retrying. Server=" + server + ", tableName=" + tableName, t);
-          receiveGlobalFailure(multiAction, server, numAttempt, t, true);
+          receiveGlobalFailure(multiAction, server, numAttempt, t);
           return;
         }
         if (res.type() == AbstractResponse.ResponseType.MULTI) {
@@ -416,21 +418,25 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
    * timeout against the appropriate tracker, or returns false if no tracker.
    */
   private boolean isOperationTimeoutExceeded() {
+    // return value of 1 is special to mean exceeded, to differentiate from 0
+    // which is no timeout. see implementation of RetryingTimeTracker.getRemainingTime
+    return getRemainingTime() == 1;
+  }
+
+  private long getRemainingTime() {
     RetryingTimeTracker currentTracker;
     if (tracker != null) {
       currentTracker = tracker;
     } else if (currentCallable != null && currentCallable.getTracker() != null) {
       currentTracker = currentCallable.getTracker();
     } else {
-      return false;
+      return 0;
     }
 
     // no-op if already started, this is just to ensure it was initialized (usually true)
     currentTracker.start();
 
-    // return value of 1 is special to mean exceeded, to differentiate from 0
-    // which is no timeout. see implementation of getRemainingTime
-    return currentTracker.getRemainingTime(operationTimeout) == 1;
+    return currentTracker.getRemainingTime(operationTimeout);
   }
 
   /**
@@ -443,30 +449,22 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
 
     boolean isReplica = false;
     List<Action> unknownReplicaActions = null;
+    List<Action> locateRegionFailedActions = null;
     for (Action action : currentActions) {
       if (isOperationTimeoutExceeded()) {
-        String message = numAttempt == 1
-          ? "Operation timeout exceeded during resolution of region locations, "
-            + "prior to executing any actions."
-          : "Operation timeout exceeded during re-resolution of region locations on retry "
-            + (numAttempt - 1) + ".";
-
-        message += " Meta may be slow or operation timeout too short for batch size or retries.";
-        OperationTimeoutExceededException exception =
-          new OperationTimeoutExceededException(message);
-
-        // Clear any actions we already resolved, because none will have been executed yet
-        // We are going to fail all passed actions because there's no way we can execute any
-        // if operation timeout is exceeded.
         actionsByServer.clear();
-        for (Action actionToFail : currentActions) {
-          manageLocationError(actionToFail, exception);
-        }
+        failIncompleteActionsWithOpTimeout(currentActions, locateRegionFailedActions, numAttempt);
         return;
       }
 
       RegionLocations locs = findAllLocationsOrFail(action, true);
-      if (locs == null) continue;
+      if (locs == null) {
+        if (locateRegionFailedActions == null) {
+          locateRegionFailedActions = new ArrayList<>(1);
+        }
+        locateRegionFailedActions.add(action);
+        continue;
+      }
       boolean isReplicaAction = !RegionReplicaUtil.isDefaultReplica(action.getReplicaId());
       if (isReplica && !isReplicaAction) {
         // This is the property of the current implementation, not a requirement.
@@ -483,6 +481,10 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
         } else {
           // TODO: relies on primary location always being fetched
           manageLocationError(action, null);
+          if (locateRegionFailedActions == null) {
+            locateRegionFailedActions = new ArrayList<>(1);
+          }
+          locateRegionFailedActions.add(action);
         }
       } else {
         byte[] regionName = loc.getRegionInfo().getRegionName();
@@ -557,6 +559,39 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
   }
 
   /**
+   * For failing all actions that were being grouped during a groupAndSendMultiAction when operation
+   * timeout was exceeded and there is no time remaining to continue grouping/sending any of the
+   * actions. We don't fail any actions which have already failed to completion during grouping due
+   * to location error (they already have an error set and had action counter decremented for)
+   * @param actions                   actions being processed by the groupAndSend when operation
+   *                                  timeout occurred
+   * @param locateRegionFailedActions actions already failed to completion due to location error
+   * @param numAttempt                the number of attempts so far
+   */
+  private void failIncompleteActionsWithOpTimeout(List<Action> actions,
+    List<Action> locateRegionFailedActions, int numAttempt) {
+    String message = numAttempt == 1
+      ? "Operation timeout exceeded during resolution of region locations, "
+        + "prior to executing any actions."
+      : "Operation timeout exceeded during re-resolution of region locations on retry "
+        + (numAttempt - 1) + ".";
+    message += " Meta may be slow or operation timeout too short for batch size or retries.";
+    OperationTimeoutExceededException exception = new OperationTimeoutExceededException(message);
+
+    for (Action actionToFail : actions) {
+      // Action equality is implemented as row equality so we check action index equality
+      // since we don't want two different actions for the same row to be considered equal here
+      boolean actionAlreadyFailed =
+        locateRegionFailedActions != null && locateRegionFailedActions.stream().anyMatch(
+          failedAction -> failedAction.getOriginalIndex() == actionToFail.getOriginalIndex()
+            && failedAction.getReplicaId() == actionToFail.getReplicaId());
+      if (!actionAlreadyFailed) {
+        manageLocationError(actionToFail, exception);
+      }
+    }
+  }
+
+  /**
    * Send a multi action structure to the servers, after a delay depending on the attempt number.
    * Asynchronous.
    * @param actionsByServer         the actions structured by regions
@@ -565,7 +600,6 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
    */
   void sendMultiAction(Map<ServerName, MultiAction> actionsByServer, int numAttempt,
     List<Action> actionsForReplicaThread, boolean reuseThread) {
-    boolean clearServerCache = true;
     // Run the last item on the same thread if we are already on a send thread.
     // We hope most of the time it will be the only item, so we can cut down on threads.
     int actionsRemaining = actionsByServer.size();
@@ -601,7 +635,6 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
               LOG.warn("id=" + asyncProcess.id + ", task rejected by pool. Unexpected." + " Server="
                 + server.getServerName(), t);
               // Do not update cache if exception is from failing to submit action to thread pool
-              clearServerCache = false;
             } else {
               // see #HBASE-14359 for more details
               LOG.warn("Caught unexpected exception/error: ", t);
@@ -609,7 +642,7 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
             asyncProcess.decTaskCounters(multiAction.getRegions(), server);
             // We're likely to fail again, but this will increment the attempt counter,
             // so it will finish.
-            receiveGlobalFailure(multiAction, server, numAttempt, t, clearServerCache);
+            receiveGlobalFailure(multiAction, server, numAttempt, t);
           }
         }
       }
@@ -759,13 +792,24 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
    * @param t          the throwable (if any) that caused the resubmit
    */
   private void receiveGlobalFailure(MultiAction rsActions, ServerName server, int numAttempt,
-    Throwable t, boolean clearServerCache) {
+    Throwable t) {
     errorsByServer.reportServerError(server);
     Retry canRetry = errorsByServer.canTryMore(numAttempt) ? Retry.YES : Retry.NO_RETRIES_EXHAUSTED;
+    boolean clearServerCache;
+
+    if (t instanceof RejectedExecutionException) {
+      clearServerCache = false;
+    } else {
+      clearServerCache = ClientExceptionsUtil.isMetaClearingException(t);
+    }
 
     // Do not update cache if exception is from failing to submit action to thread pool
     if (clearServerCache) {
       cleanServerCache(server, t);
+
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Cleared meta cache for server {} due to global failure {}", server, t);
+      }
     }
 
     int failed = 0;
@@ -774,12 +818,8 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
     for (Map.Entry<byte[], List<Action>> e : rsActions.actions.entrySet()) {
       byte[] regionName = e.getKey();
       byte[] row = e.getValue().get(0).getAction().getRow();
-      // Do not use the exception for updating cache because it might be coming from
-      // any of the regions in the MultiAction and do not update cache if exception is
-      // from failing to submit action to thread pool
       if (clearServerCache) {
-        updateCachedLocations(server, regionName, row,
-          ClientExceptionsUtil.isMetaClearingException(t) ? null : t);
+        updateCachedLocations(server, regionName, row, t);
       }
       for (Action action : e.getValue()) {
         Retry retry =
@@ -820,6 +860,8 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
     long backOffTime;
     if (retryImmediately) {
       backOffTime = 0;
+    } else if (throwable instanceof RpcThrottlingException) {
+      backOffTime = ((RpcThrottlingException) throwable).getWaitInterval();
     } else if (HBaseServerException.isServerOverloaded(throwable)) {
       // Give a special check when encountering an exception indicating the server is overloaded.
       // see #HBASE-17114 and HBASE-26807
@@ -840,6 +882,19 @@ class AsyncRequestFutureImpl<CResult> implements AsyncRequestFuture {
       // logs, as errors are to be expected when a region moves, splits and so on
       LOG.info(createLog(numAttempt, failureCount, toReplay.size(), oldServer, throwable,
         backOffTime, true, null, -1, -1));
+    }
+
+    long remainingTime = getRemainingTime();
+    // 1 is a special value meaning exceeded and 0 means no timeout.
+    // throw if timeout already exceeded, or if backoff is larger than non-zero remaining
+    if (remainingTime == 1 || (remainingTime > 0 && backOffTime > remainingTime)) {
+      OperationTimeoutExceededException ex = new OperationTimeoutExceededException(
+        "Backoff time of " + backOffTime + "ms would exceed operation timeout", throwable);
+      for (Action actionToFail : toReplay) {
+        manageError(actionToFail.getOriginalIndex(), actionToFail.getAction(),
+          Retry.NO_NOT_RETRIABLE, ex, null);
+      }
+      return;
     }
 
     try {

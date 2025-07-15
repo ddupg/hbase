@@ -18,8 +18,6 @@
 package org.apache.hadoop.hbase.io.hfile;
 
 import java.io.IOException;
-import java.util.Optional;
-import org.apache.commons.lang3.mutable.MutableBoolean;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
@@ -34,18 +32,14 @@ import org.slf4j.LoggerFactory;
 public class HFilePreadReader extends HFileReaderImpl {
   private static final Logger LOG = LoggerFactory.getLogger(HFileReaderImpl.class);
 
+  private static final int WAIT_TIME_FOR_CACHE_INITIALIZATION = 10 * 60 * 1000;
+
   public HFilePreadReader(ReaderContext context, HFileInfo fileInfo, CacheConfig cacheConf,
     Configuration conf) throws IOException {
     super(context, fileInfo, cacheConf, conf);
-    final MutableBoolean shouldCache = new MutableBoolean(true);
-
-    cacheConf.getBlockCache().ifPresent(cache -> {
-      Optional<Boolean> result = cache.shouldCacheFile(path.getName());
-      shouldCache.setValue(result.isPresent() ? result.get().booleanValue() : true);
-    });
-
+    // master hosted regions, like the master procedures store wouldn't have a block cache
     // Prefetch file blocks upon open if requested
-    if (cacheConf.shouldPrefetchOnOpen() && cacheIfCompactionsOff() && shouldCache.booleanValue()) {
+    if (cacheConf.getBlockCache().isPresent() && cacheConf.shouldPrefetchOnOpen()) {
       PrefetchExecutor.request(path, new Runnable() {
         @Override
         public void run() {
@@ -53,6 +47,8 @@ public class HFilePreadReader extends HFileReaderImpl {
           long end = 0;
           HFile.Reader prefetchStreamReader = null;
           try {
+            cacheConf.getBlockCache().ifPresent(
+              cache -> cache.waitForCacheInitialization(WAIT_TIME_FOR_CACHE_INITIALIZATION));
             ReaderContext streamReaderContext = ReaderContextBuilder.newBuilder(context)
               .withReaderType(ReaderContext.ReaderType.STREAM)
               .withInputStreamWrapper(new FSDataInputStreamWrapper(context.getFileSystem(),
@@ -90,6 +86,9 @@ public class HFilePreadReader extends HFileReaderImpl {
                     + "Skipping prefetch, the block is already cached.", size, cacheKey);
                   blockCount++;
                   dataBlockCount++;
+                  // We need to reset this here, because we don't know the size of next block, since
+                  // we never recovered the current block.
+                  onDiskSizeOfNextBlock = -1;
                   continue;
                 } else {
                   LOG.debug("Found block for cache key {}, but couldn't get its size. "
@@ -106,13 +105,23 @@ public class HFilePreadReader extends HFileReaderImpl {
               HFileBlock block = prefetchStreamReader.readBlock(offset, onDiskSizeOfNextBlock,
                 /* cacheBlock= */true, /* pread= */false, false, false, null, null, true);
               try {
-                if (!cacheConf.isInMemory() && !cache.blockFitsIntoTheCache(block).orElse(true)) {
-                  LOG.warn(
-                    "Interrupting prefetch for file {} because block {} of size {} "
-                      + "doesn't fit in the available cache space.",
-                    path, cacheKey, block.getOnDiskSizeWithHeader());
-                  interrupted = true;
-                  break;
+                if (!cacheConf.isInMemory()) {
+                  if (!cache.blockFitsIntoTheCache(block).orElse(true)) {
+                    LOG.warn(
+                      "Interrupting prefetch for file {} because block {} of size {} "
+                        + "doesn't fit in the available cache space. isCacheEnabled: {}",
+                      path, cacheKey, block.getOnDiskSizeWithHeader(), cache.isCacheEnabled());
+                    interrupted = true;
+                    break;
+                  }
+                  if (!cacheConf.isHeapUsageBelowThreshold()) {
+                    LOG.warn(
+                      "Interrupting prefetch because heap usage is above the threshold: {} "
+                        + "configured via {}",
+                      cacheConf.getHeapUsageThreshold(), CacheConfig.PREFETCH_HEAP_USAGE_THRESHOLD);
+                    interrupted = true;
+                    break;
+                  }
                 }
                 onDiskSizeOfNextBlock = block.getNextBlockOnDiskSize();
                 offset += block.getOnDiskSizeWithHeader();
@@ -133,8 +142,8 @@ public class HFilePreadReader extends HFileReaderImpl {
             }
           } catch (IOException e) {
             // IOExceptions are probably due to region closes (relocation, etc.)
-            if (LOG.isTraceEnabled()) {
-              LOG.trace("Prefetch " + getPathOffsetEndStr(path, offset, end), e);
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Prefetch " + getPathOffsetEndStr(path, offset, end), e);
             }
           } catch (Throwable e) {
             // Other exceptions are interesting

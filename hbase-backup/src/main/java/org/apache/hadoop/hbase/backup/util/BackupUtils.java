@@ -656,22 +656,28 @@ public final class BackupUtils {
    */
   public static RestoreRequest createRestoreRequest(String backupRootDir, String backupId,
     boolean check, TableName[] fromTables, TableName[] toTables, boolean isOverwrite) {
+    return createRestoreRequest(backupRootDir, backupId, check, fromTables, toTables, isOverwrite,
+      false);
+  }
+
+  public static RestoreRequest createRestoreRequest(String backupRootDir, String backupId,
+    boolean check, TableName[] fromTables, TableName[] toTables, boolean isOverwrite,
+    boolean isKeepOriginalSplits) {
     RestoreRequest.Builder builder = new RestoreRequest.Builder();
-    RestoreRequest request =
-      builder.withBackupRootDir(backupRootDir).withBackupId(backupId).withCheck(check)
-        .withFromTables(fromTables).withToTables(toTables).withOvewrite(isOverwrite).build();
+    RestoreRequest request = builder.withBackupRootDir(backupRootDir).withBackupId(backupId)
+      .withCheck(check).withFromTables(fromTables).withToTables(toTables).withOvewrite(isOverwrite)
+      .withKeepOriginalSplits(isKeepOriginalSplits).build();
     return request;
   }
 
-  public static boolean validate(HashMap<TableName, BackupManifest> backupManifestMap,
+  public static boolean validate(List<TableName> tables, BackupManifest backupManifest,
     Configuration conf) throws IOException {
     boolean isValid = true;
 
-    for (Entry<TableName, BackupManifest> manifestEntry : backupManifestMap.entrySet()) {
-      TableName table = manifestEntry.getKey();
+    for (TableName table : tables) {
       TreeSet<BackupImage> imageSet = new TreeSet<>();
 
-      ArrayList<BackupImage> depList = manifestEntry.getValue().getDependentListByTable(table);
+      ArrayList<BackupImage> depList = backupManifest.getDependentListByTable(table);
       if (depList != null && !depList.isEmpty()) {
         imageSet.addAll(depList);
       }

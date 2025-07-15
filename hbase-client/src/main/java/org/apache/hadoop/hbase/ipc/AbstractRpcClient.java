@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.ipc;
 import static org.apache.hadoop.hbase.ipc.IPCUtil.toIOE;
 import static org.apache.hadoop.hbase.ipc.IPCUtil.wrapException;
 
+import com.google.errorprone.annotations.RestrictedApi;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.context.Scope;
@@ -209,7 +210,7 @@ public abstract class AbstractRpcClient<T extends RpcConnection> implements RpcC
       for (T conn : connections.values()) {
         // Remove connection if it has not been chosen by anyone for more than maxIdleTime, and the
         // connection itself has already shutdown. The latter check is because we may still
-        // have some pending calls on connection so we should not shutdown the connection outside.
+        // have some pending calls on connection, so we should not shut down the connection outside.
         // The connection itself will disconnect if there is no pending call for maxIdleTime.
         if (conn.getLastTouched() < closeBeforeTime && !conn.isActive()) {
           if (LOG.isTraceEnabled()) {
@@ -454,7 +455,7 @@ public abstract class AbstractRpcClient<T extends RpcConnection> implements RpcC
     }
   }
 
-  private static Address createAddr(ServerName sn) {
+  static Address createAddr(ServerName sn) {
     return Address.fromParts(sn.getHostname(), sn.getPort());
   }
 
@@ -540,6 +541,12 @@ public abstract class AbstractRpcClient<T extends RpcConnection> implements RpcC
   @Override
   public RpcChannel createRpcChannel(ServerName sn, User user, int rpcTimeout) {
     return new RpcChannelImplementation(this, createAddr(sn), user, rpcTimeout);
+  }
+
+  @RestrictedApi(explanation = "Should only be called in tests", link = "",
+      allowedOnPath = ".*/src/test/.*")
+  PoolMap<ConnectionId, T> getConnections() {
+    return connections;
   }
 
   private static class AbstractRpcChannel {

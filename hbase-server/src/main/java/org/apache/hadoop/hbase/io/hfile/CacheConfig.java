@@ -20,6 +20,8 @@ package org.apache.hadoop.hbase.io.hfile;
 import java.util.Optional;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
+import org.apache.hadoop.hbase.conf.ConfigurationManager;
+import org.apache.hadoop.hbase.conf.PropagatingConfigurationObserver;
 import org.apache.hadoop.hbase.io.ByteBuffAllocator;
 import org.apache.hadoop.hbase.io.hfile.BlockType.BlockCategory;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -30,7 +32,7 @@ import org.slf4j.LoggerFactory;
  * Stores all of the cache objects and configuration for a single HFile.
  */
 @InterfaceAudience.Private
-public class CacheConfig {
+public class CacheConfig implements PropagatingConfigurationObserver {
   private static final Logger LOG = LoggerFactory.getLogger(CacheConfig.class.getName());
 
   /**
@@ -71,6 +73,8 @@ public class CacheConfig {
    */
   public static final String EVICT_BLOCKS_ON_CLOSE_KEY = "hbase.rs.evictblocksonclose";
 
+  public static final String EVICT_BLOCKS_ON_SPLIT_KEY = "hbase.rs.evictblocksonsplit";
+
   /**
    * Configuration key to prefetch all blocks of a given file into the block cache when the file is
    * opened.
@@ -99,6 +103,12 @@ public class CacheConfig {
   public static final String BUCKETCACHE_PERSIST_INTERVAL_KEY =
     "hbase.bucketcache.persist.intervalinmillis";
 
+  /**
+   * Configuration key to set the heap usage threshold limit once prefetch threads should be
+   * interrupted.
+   */
+  public static final String PREFETCH_HEAP_USAGE_THRESHOLD = "hbase.rs.prefetchheapusage";
+
   // Defaults
   public static final boolean DEFAULT_CACHE_DATA_ON_READ = true;
   public static final boolean DEFAULT_CACHE_DATA_ON_WRITE = false;
@@ -106,24 +116,26 @@ public class CacheConfig {
   public static final boolean DEFAULT_CACHE_INDEXES_ON_WRITE = false;
   public static final boolean DEFAULT_CACHE_BLOOMS_ON_WRITE = false;
   public static final boolean DEFAULT_EVICT_ON_CLOSE = false;
+  public static final boolean DEFAULT_EVICT_ON_SPLIT = true;
   public static final boolean DEFAULT_CACHE_DATA_COMPRESSED = false;
   public static final boolean DEFAULT_PREFETCH_ON_OPEN = false;
   public static final boolean DEFAULT_CACHE_COMPACTED_BLOCKS_ON_WRITE = false;
   public static final boolean DROP_BEHIND_CACHE_COMPACTION_DEFAULT = true;
   public static final long DEFAULT_CACHE_COMPACTED_BLOCKS_ON_WRITE_THRESHOLD = Long.MAX_VALUE;
+  public static final double DEFAULT_PREFETCH_HEAP_USAGE_THRESHOLD = 1d;
 
   /**
    * Whether blocks should be cached on read (default is on if there is a cache but this can be
    * turned off on a per-family or per-request basis). If off we will STILL cache meta blocks; i.e.
    * INDEX and BLOOM types. This cannot be disabled.
    */
-  private final boolean cacheDataOnRead;
+  private volatile boolean cacheDataOnRead;
 
   /** Whether blocks should be flagged as in-memory when being cached */
   private final boolean inMemory;
 
   /** Whether data blocks should be cached when new files are written */
-  private boolean cacheDataOnWrite;
+  private volatile boolean cacheDataOnWrite;
 
   /** Whether index blocks should be cached when new files are written */
   private boolean cacheIndexesOnWrite;
@@ -156,6 +168,8 @@ public class CacheConfig {
   private final BlockCache blockCache;
 
   private final ByteBuffAllocator byteBuffAllocator;
+
+  private final double heapUsageThreshold;
 
   /**
    * Create a cache configuration using the specified configuration object and defaults for family
@@ -201,6 +215,8 @@ public class CacheConfig {
     this.cacheCompactedDataOnWrite =
       conf.getBoolean(CACHE_COMPACTED_BLOCKS_ON_WRITE_KEY, DEFAULT_CACHE_COMPACTED_BLOCKS_ON_WRITE);
     this.cacheCompactedDataOnWriteThreshold = getCacheCompactedBlocksOnWriteThreshold(conf);
+    this.heapUsageThreshold =
+      conf.getDouble(PREFETCH_HEAP_USAGE_THRESHOLD, DEFAULT_PREFETCH_HEAP_USAGE_THRESHOLD);
     this.blockCache = blockCache;
     this.byteBuffAllocator = byteBuffAllocator;
   }
@@ -222,6 +238,7 @@ public class CacheConfig {
     this.dropBehindCompaction = cacheConf.dropBehindCompaction;
     this.blockCache = cacheConf.blockCache;
     this.byteBuffAllocator = cacheConf.byteBuffAllocator;
+    this.heapUsageThreshold = cacheConf.heapUsageThreshold;
   }
 
   private CacheConfig() {
@@ -237,6 +254,7 @@ public class CacheConfig {
     this.dropBehindCompaction = false;
     this.blockCache = null;
     this.byteBuffAllocator = ByteBuffAllocator.HEAP;
+    this.heapUsageThreshold = DEFAULT_PREFETCH_HEAP_USAGE_THRESHOLD;
   }
 
   /**
@@ -387,6 +405,17 @@ public class CacheConfig {
   }
 
   /**
+   * Checks if the current heap usage is below the threshold configured by
+   * "hbase.rs.prefetchheapusage" (0.8 by default).
+   */
+  public boolean isHeapUsageBelowThreshold() {
+    double total = Runtime.getRuntime().maxMemory();
+    double available = Runtime.getRuntime().freeMemory();
+    double usedRatio = 1d - (available / total);
+    return heapUsageThreshold > usedRatio;
+  }
+
+  /**
    * If we make sure the block could not be cached, we will not acquire the lock otherwise we will
    * acquire lock
    */
@@ -413,6 +442,10 @@ public class CacheConfig {
     return this.byteBuffAllocator;
   }
 
+  public double getHeapUsageThreshold() {
+    return heapUsageThreshold;
+  }
+
   private long getCacheCompactedBlocksOnWriteThreshold(Configuration conf) {
     long cacheCompactedBlocksOnWriteThreshold =
       conf.getLong(CACHE_COMPACTED_BLOCKS_ON_WRITE_THRESHOLD_KEY,
@@ -435,5 +468,27 @@ public class CacheConfig {
       + ", cacheBloomsOnWrite=" + shouldCacheBloomsOnWrite() + ", cacheEvictOnClose="
       + shouldEvictOnClose() + ", cacheDataCompressed=" + shouldCacheDataCompressed()
       + ", prefetchOnOpen=" + shouldPrefetchOnOpen();
+  }
+
+  @Override
+  public void onConfigurationChange(Configuration conf) {
+    cacheDataOnRead = conf.getBoolean(CACHE_DATA_ON_READ_KEY, DEFAULT_CACHE_DATA_ON_READ);
+    cacheDataOnWrite = conf.getBoolean(CACHE_BLOCKS_ON_WRITE_KEY, DEFAULT_CACHE_DATA_ON_WRITE);
+    evictOnClose = conf.getBoolean(EVICT_BLOCKS_ON_CLOSE_KEY, DEFAULT_EVICT_ON_CLOSE);
+    LOG.info(
+      "Config hbase.block.data.cacheonread is changed to {}, "
+        + "hbase.rs.cacheblocksonwrite is changed to {}, "
+        + "hbase.rs.evictblocksonclose is changed to {}",
+      cacheDataOnRead, cacheDataOnWrite, evictOnClose);
+  }
+
+  @Override
+  public void registerChildren(ConfigurationManager manager) {
+    manager.registerObserver(blockCache);
+  }
+
+  @Override
+  public void deregisterChildren(ConfigurationManager manager) {
+    manager.deregisterObserver(blockCache);
   }
 }

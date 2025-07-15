@@ -351,7 +351,7 @@ public class ConnectionImplementation implements ClusterConnection, Closeable {
 
     try {
       if (registry == null) {
-        this.registry = ConnectionRegistryFactory.getRegistry(conf);
+        this.registry = ConnectionRegistryFactory.create(conf, user);
       } else {
         this.registry = registry;
       }
@@ -411,7 +411,7 @@ public class ConnectionImplementation implements ClusterConnection, Closeable {
             int numOfReplicas = 1;
             try {
               RegionLocations metaLocations = this.registry.getMetaRegionLocations()
-                .get(connectionConfig.getReadRpcTimeout(), TimeUnit.MILLISECONDS);
+                .get(connectionConfig.getMetaReadRpcTimeout(), TimeUnit.MILLISECONDS);
               numOfReplicas = metaLocations.size();
             } catch (Exception e) {
               LOG.error("Failed to get table {}'s region replication, ", META_TABLE_NAME, e);
@@ -518,6 +518,9 @@ public class ConnectionImplementation implements ClusterConnection, Closeable {
     }
     if (params.getMaxKeyValueSize() == BufferedMutatorParams.UNSET) {
       params.maxKeyValueSize(connectionConfig.getMaxKeyValueSize());
+    }
+    if (params.getMaxMutations() == BufferedMutatorParams.UNSET) {
+      params.setMaxMutations(connectionConfig.getBufferedMutatorMaxMutations());
     }
     // Look to see if an alternate BufferedMutation implementation is wanted.
     // Look in params and in config. If null, use default.

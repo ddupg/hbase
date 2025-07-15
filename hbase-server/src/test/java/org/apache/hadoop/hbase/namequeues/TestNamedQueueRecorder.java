@@ -22,6 +22,7 @@ import java.lang.reflect.Constructor;
 import java.net.InetAddress;
 import java.security.PrivilegedAction;
 import java.security.PrivilegedExceptionAction;
+import java.security.cert.X509Certificate;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -381,6 +382,60 @@ public class TestNamedQueueRecorder {
   }
 
   @Test
+  public void testSlowLogFilterWithClientAddress() throws Exception {
+    Configuration conf = applySlowLogRecorderConf(10);
+    Constructor<NamedQueueRecorder> constructor =
+      NamedQueueRecorder.class.getDeclaredConstructor(Configuration.class);
+    constructor.setAccessible(true);
+    namedQueueRecorder = constructor.newInstance(conf);
+    AdminProtos.SlowLogResponseRequest request =
+      AdminProtos.SlowLogResponseRequest.newBuilder().build();
+    Assert.assertEquals(getSlowLogPayloads(request).size(), 0);
+
+    String[] clientAddressArray = new String[] { "[127:1:1:1:1:1:1:1]:1", "[127:1:1:1:1:1:1:1]:2",
+      "[127:1:1:1:1:1:1:1]:3", "127.0.0.1:1", "127.0.0.1:2" };
+    boolean isSlowLog;
+    boolean isLargeLog;
+    for (int i = 0; i < 10; i++) {
+      if (i % 2 == 0) {
+        isSlowLog = true;
+        isLargeLog = false;
+      } else {
+        isSlowLog = false;
+        isLargeLog = true;
+      }
+      RpcLogDetails rpcLogDetails = getRpcLogDetails("userName_" + (i + 1),
+        clientAddressArray[i % 5], "class_" + (i + 1), isSlowLog, isLargeLog);
+      namedQueueRecorder.addRecord(rpcLogDetails);
+    }
+
+    AdminProtos.SlowLogResponseRequest largeLogRequestIPv6WithPort =
+      AdminProtos.SlowLogResponseRequest.newBuilder()
+        .setLogType(AdminProtos.SlowLogResponseRequest.LogType.LARGE_LOG)
+        .setClientAddress("[127:1:1:1:1:1:1:1]:2").build();
+    Assert.assertNotEquals(-1, HBASE_TESTING_UTILITY.waitFor(3000,
+      () -> getSlowLogPayloads(largeLogRequestIPv6WithPort).size() == 1));
+    AdminProtos.SlowLogResponseRequest largeLogRequestIPv6WithoutPort =
+      AdminProtos.SlowLogResponseRequest.newBuilder()
+        .setLogType(AdminProtos.SlowLogResponseRequest.LogType.LARGE_LOG)
+        .setClientAddress("[127:1:1:1:1:1:1:1]").build();
+    Assert.assertNotEquals(-1, HBASE_TESTING_UTILITY.waitFor(3000,
+      () -> getSlowLogPayloads(largeLogRequestIPv6WithoutPort).size() == 3));
+    AdminProtos.SlowLogResponseRequest largeLogRequestIPv4WithPort =
+      AdminProtos.SlowLogResponseRequest.newBuilder()
+        .setLogType(AdminProtos.SlowLogResponseRequest.LogType.LARGE_LOG)
+        .setClientAddress("127.0.0.1:1").build();
+    Assert.assertNotEquals(-1, HBASE_TESTING_UTILITY.waitFor(3000,
+      () -> getSlowLogPayloads(largeLogRequestIPv4WithPort).size() == 1));
+    AdminProtos.SlowLogResponseRequest largeLogRequestIPv4WithoutPort =
+      AdminProtos.SlowLogResponseRequest.newBuilder()
+        .setLogType(AdminProtos.SlowLogResponseRequest.LogType.LARGE_LOG)
+        .setClientAddress("127.0.0.1").build();
+    Assert.assertNotEquals(-1, HBASE_TESTING_UTILITY.waitFor(3000,
+      () -> getSlowLogPayloads(largeLogRequestIPv4WithoutPort).size() == 2));
+  }
+
+  @Test
   public void testConcurrentSlowLogEvents() throws Exception {
 
     Configuration conf = applySlowLogRecorderConf(50000);
@@ -667,13 +722,13 @@ public class TestNamedQueueRecorder {
   static RpcLogDetails getRpcLogDetails(String userName, String clientAddress, String className,
     int forcedParamIndex) {
     RpcCall rpcCall = getRpcCall(userName, forcedParamIndex);
-    return new RpcLogDetails(rpcCall, rpcCall.getParam(), clientAddress, 0, 0, className, true,
+    return new RpcLogDetails(rpcCall, rpcCall.getParam(), clientAddress, 0, 0, 0, className, true,
       true);
   }
 
   static RpcLogDetails getRpcLogDetails(String userName, String clientAddress, String className) {
     RpcCall rpcCall = getRpcCall(userName);
-    return new RpcLogDetails(rpcCall, rpcCall.getParam(), clientAddress, 0, 0, className, true,
+    return new RpcLogDetails(rpcCall, rpcCall.getParam(), clientAddress, 0, 0, 0, className, true,
       true);
   }
 
@@ -685,8 +740,8 @@ public class TestNamedQueueRecorder {
   private RpcLogDetails getRpcLogDetails(String userName, String clientAddress, String className,
     boolean isSlowLog, boolean isLargeLog) {
     RpcCall rpcCall = getRpcCall(userName);
-    return new RpcLogDetails(rpcCall, rpcCall.getParam(), clientAddress, 0, 0, className, isSlowLog,
-      isLargeLog);
+    return new RpcLogDetails(rpcCall, rpcCall.getParam(), clientAddress, 0, 0, 0, className,
+      isSlowLog, isLargeLog);
   }
 
   private static RpcCall getRpcCall(String userName) {
@@ -815,6 +870,11 @@ public class TestNamedQueueRecorder {
       }
 
       @Override
+      public Optional<X509Certificate[]> getClientCertificateChain() {
+        return Optional.empty();
+      }
+
+      @Override
       public InetAddress getRemoteAddress() {
         return null;
       }
@@ -858,6 +918,16 @@ public class TestNamedQueueRecorder {
 
       @Override
       public void incrementResponseExceptionSize(long exceptionSize) {
+      }
+
+      @Override
+      public void updateFsReadTime(long latencyMillis) {
+
+      }
+
+      @Override
+      public long getFsReadTime() {
+        return 0;
       }
     };
     return rpcCall;

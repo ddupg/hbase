@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.quotas;
 import static org.apache.hadoop.hbase.util.ConcurrentMapUtils.computeIfAbsent;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -28,6 +29,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ClusterMetrics;
 import org.apache.hadoop.hbase.ClusterMetrics.Option;
@@ -48,6 +50,10 @@ import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.hbase.thirdparty.com.google.common.cache.CacheBuilder;
+import org.apache.hbase.thirdparty.com.google.common.cache.CacheLoader;
+import org.apache.hbase.thirdparty.com.google.common.cache.LoadingCache;
+
 /**
  * Cache that keeps track of the quota settings for the users and tables that are interacting with
  * it. To avoid blocking the operations if the requested quota is not in cache an "empty quota" will
@@ -61,16 +67,22 @@ public class QuotaCache implements Stoppable {
   private static final Logger LOG = LoggerFactory.getLogger(QuotaCache.class);
 
   public static final String REFRESH_CONF_KEY = "hbase.quota.refresh.period";
+  public static final String TABLE_REGION_STATES_CACHE_TTL_MS =
+    "hbase.quota.cache.ttl.region.states.ms";
+  public static final String REGION_SERVERS_SIZE_CACHE_TTL_MS =
+    "hbase.quota.cache.ttl.servers.size.ms";
 
   // defines the request attribute key which, when provided, will override the request's username
   // from the perspective of user quotas
   public static final String QUOTA_USER_REQUEST_ATTRIBUTE_OVERRIDE_KEY =
     "hbase.quota.user.override.key";
-  private static final int REFRESH_DEFAULT_PERIOD = 5 * 60000; // 5min
-  private static final int EVICT_PERIOD_FACTOR = 5; // N * REFRESH_DEFAULT_PERIOD
+  private static final int REFRESH_DEFAULT_PERIOD = 43_200_000; // 12 hours
+  private static final int EVICT_PERIOD_FACTOR = 5;
 
   // for testing purpose only, enforce the cache to be always refreshed
   static boolean TEST_FORCE_REFRESH = false;
+  // for testing purpose only, block cache refreshes to reliably verify state
+  static boolean TEST_BLOCK_REFRESH = false;
 
   private final ConcurrentMap<String, QuotaState> namespaceQuotaCache = new ConcurrentHashMap<>();
   private final ConcurrentMap<TableName, QuotaState> tableQuotaCache = new ConcurrentHashMap<>();
@@ -97,10 +109,14 @@ public class QuotaCache implements Stoppable {
   public void start() throws IOException {
     stopped = false;
 
-    // TODO: This will be replaced once we have the notification bus ready.
     Configuration conf = rsServices.getConfiguration();
+    // Refresh the cache every 12 hours, and every time a quota is changed, and every time a
+    // configuration
+    // reload is triggered. Periodic reloads are kept to a minimum to avoid flooding the
+    // RegionServer
+    // holding the hbase:quota table with requests.
     int period = conf.getInt(REFRESH_CONF_KEY, REFRESH_DEFAULT_PERIOD);
-    refreshChore = new QuotaRefresherChore(period, this);
+    refreshChore = new QuotaRefresherChore(conf, period, this);
     rsServices.getChoreService().scheduleChore(refreshChore);
   }
 
@@ -137,8 +153,8 @@ public class QuotaCache implements Stoppable {
    * @return the quota info associated to specified user
    */
   public UserQuotaState getUserQuotaState(final UserGroupInformation ugi) {
-    return computeIfAbsent(userQuotaCache, getQuotaUserName(ugi), UserQuotaState::new,
-      this::triggerCacheRefresh);
+    return computeIfAbsent(userQuotaCache, getQuotaUserName(ugi),
+      () -> QuotaUtil.buildDefaultUserQuotaState(rsServices.getConfiguration(), 0L));
   }
 
   /**
@@ -199,11 +215,15 @@ public class QuotaCache implements Stoppable {
    * returned and the quota request will be enqueued for the next cache refresh.
    */
   private <K> QuotaState getQuotaState(final ConcurrentMap<K, QuotaState> quotasMap, final K key) {
-    return computeIfAbsent(quotasMap, key, QuotaState::new, this::triggerCacheRefresh);
+    return computeIfAbsent(quotasMap, key, QuotaState::new);
   }
 
   void triggerCacheRefresh() {
     refreshChore.triggerNow();
+  }
+
+  void forceSynchronousCacheRefresh() {
+    refreshChore.chore();
   }
 
   long getLastUpdate() {
@@ -230,14 +250,47 @@ public class QuotaCache implements Stoppable {
   private class QuotaRefresherChore extends ScheduledChore {
     private long lastUpdate = 0;
 
-    public QuotaRefresherChore(final int period, final Stoppable stoppable) {
+    // Querying cluster metrics so often, per-RegionServer, limits horizontal scalability.
+    // So we cache the results to reduce that load.
+    private final RefreshableExpiringValueCache<ClusterMetrics> tableRegionStatesClusterMetrics;
+    private final RefreshableExpiringValueCache<Integer> regionServersSize;
+
+    public QuotaRefresherChore(Configuration conf, final int period, final Stoppable stoppable) {
       super("QuotaRefresherChore", stoppable, period);
+
+      Duration tableRegionStatesCacheTtl =
+        Duration.ofMillis(conf.getLong(TABLE_REGION_STATES_CACHE_TTL_MS, period));
+      this.tableRegionStatesClusterMetrics =
+        new RefreshableExpiringValueCache<>("tableRegionStatesClusterMetrics",
+          tableRegionStatesCacheTtl, () -> rsServices.getConnection().getAdmin()
+            .getClusterMetrics(EnumSet.of(Option.SERVERS_NAME, Option.TABLE_TO_REGIONS_COUNT)));
+
+      Duration regionServersSizeCacheTtl =
+        Duration.ofMillis(conf.getLong(REGION_SERVERS_SIZE_CACHE_TTL_MS, period));
+      regionServersSize =
+        new RefreshableExpiringValueCache<>("regionServersSize", regionServersSizeCacheTtl,
+          () -> rsServices.getConnection().getAdmin().getRegionServers().size());
+    }
+
+    @Override
+    public synchronized boolean triggerNow() {
+      tableRegionStatesClusterMetrics.invalidate();
+      regionServersSize.invalidate();
+      return super.triggerNow();
     }
 
     @Override
     @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "GC_UNRELATED_TYPES",
         justification = "I do not understand why the complaints, it looks good to me -- FIX")
     protected void chore() {
+      while (TEST_BLOCK_REFRESH) {
+        LOG.info("TEST_BLOCK_REFRESH=true, so blocking QuotaCache refresh until it is false");
+        try {
+          Thread.sleep(10);
+        } catch (InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
       // Prefetch online tables/namespaces
       for (TableName table : ((HRegionServer) QuotaCache.this.rsServices).getOnlineTables()) {
         if (table.isSystemTable()) {
@@ -336,18 +389,15 @@ public class QuotaCache implements Stoppable {
     private <K, V extends QuotaState> void fetch(final String type,
       final ConcurrentMap<K, V> quotasMap, final Fetcher<K, V> fetcher) {
       long now = EnvironmentEdgeManager.currentTime();
-      long refreshPeriod = getPeriod();
-      long evictPeriod = refreshPeriod * EVICT_PERIOD_FACTOR;
-
+      long evictPeriod = getPeriod() * EVICT_PERIOD_FACTOR;
       // Find the quota entries to update
       List<Get> gets = new ArrayList<>();
       List<K> toRemove = new ArrayList<>();
       for (Map.Entry<K, V> entry : quotasMap.entrySet()) {
-        long lastUpdate = entry.getValue().getLastUpdate();
         long lastQuery = entry.getValue().getLastQuery();
         if (lastQuery > 0 && (now - lastQuery) >= evictPeriod) {
           toRemove.add(entry.getKey());
-        } else if (TEST_FORCE_REFRESH || (now - lastUpdate) >= refreshPeriod) {
+        } else {
           gets.add(fetcher.makeGet(entry));
         }
       }
@@ -384,21 +434,40 @@ public class QuotaCache implements Stoppable {
      * over table quota, use [1 / TotalTableRegionNum * MachineTableRegionNum] as machine factor.
      */
     private void updateQuotaFactors() {
-      // Update machine quota factor
-      ClusterMetrics clusterMetrics;
-      try {
-        clusterMetrics = rsServices.getConnection().getAdmin()
-          .getClusterMetrics(EnumSet.of(Option.SERVERS_NAME, Option.TABLE_TO_REGIONS_COUNT));
-      } catch (IOException e) {
-        LOG.warn("Failed to get cluster metrics needed for updating quotas", e);
+      boolean hasTableQuotas = !tableQuotaCache.entrySet().isEmpty()
+        || userQuotaCache.values().stream().anyMatch(UserQuotaState::hasTableLimiters);
+      if (hasTableQuotas) {
+        updateTableMachineQuotaFactors();
+      } else {
+        updateOnlyMachineQuotaFactors();
+      }
+    }
+
+    /**
+     * This method is cheaper than {@link #updateTableMachineQuotaFactors()} and should be used if
+     * we don't have any table quotas in the cache.
+     */
+    private void updateOnlyMachineQuotaFactors() {
+      Optional<Integer> rsSize = regionServersSize.get();
+      if (rsSize.isPresent()) {
+        updateMachineQuotaFactors(rsSize.get());
+      } else {
+        regionServersSize.refresh();
+      }
+    }
+
+    /**
+     * This will call {@link #updateMachineQuotaFactors(int)}, and then update the table machine
+     * factors as well. This relies on a more expensive query for ClusterMetrics.
+     */
+    private void updateTableMachineQuotaFactors() {
+      Optional<ClusterMetrics> clusterMetricsMaybe = tableRegionStatesClusterMetrics.get();
+      if (!clusterMetricsMaybe.isPresent()) {
+        tableRegionStatesClusterMetrics.refresh();
         return;
       }
-
-      int rsSize = clusterMetrics.getServersName().size();
-      if (rsSize != 0) {
-        // TODO if use rs group, the cluster limit should be shared by the rs group
-        machineQuotaFactor = 1.0 / rsSize;
-      }
+      ClusterMetrics clusterMetrics = clusterMetricsMaybe.get();
+      updateMachineQuotaFactors(clusterMetrics.getServersName().size());
 
       Map<TableName, RegionStatesCount> tableRegionStatesCount =
         clusterMetrics.getTableRegionStatesCount();
@@ -425,6 +494,53 @@ public class QuotaCache implements Stoppable {
         }
       }
     }
+
+    private void updateMachineQuotaFactors(int rsSize) {
+      if (rsSize != 0) {
+        // TODO if use rs group, the cluster limit should be shared by the rs group
+        machineQuotaFactor = 1.0 / rsSize;
+      }
+    }
+  }
+
+  static class RefreshableExpiringValueCache<T> {
+    private final String name;
+    private final LoadingCache<String, Optional<T>> cache;
+
+    RefreshableExpiringValueCache(String name, Duration refreshPeriod,
+      ThrowingSupplier<T> supplier) {
+      this.name = name;
+      this.cache =
+        CacheBuilder.newBuilder().expireAfterWrite(refreshPeriod.toMillis(), TimeUnit.MILLISECONDS)
+          .build(new CacheLoader<String, Optional<T>>() {
+            @Override
+            public Optional<T> load(String key) {
+              try {
+                return Optional.of(supplier.get());
+              } catch (Exception e) {
+                LOG.warn("Failed to refresh cache {}", name, e);
+                return Optional.empty();
+              }
+            }
+          });
+    }
+
+    Optional<T> get() {
+      return cache.getUnchecked(name);
+    }
+
+    void refresh() {
+      cache.refresh(name);
+    }
+
+    void invalidate() {
+      cache.invalidate(name);
+    }
+  }
+
+  @FunctionalInterface
+  static interface ThrowingSupplier<T> {
+    T get() throws Exception;
   }
 
   static interface Fetcher<Key, Value> {

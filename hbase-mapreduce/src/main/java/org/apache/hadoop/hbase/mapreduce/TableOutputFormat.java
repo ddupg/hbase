@@ -30,6 +30,7 @@ import org.apache.hadoop.hbase.client.BufferedMutator;
 import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Delete;
+import org.apache.hadoop.hbase.client.Durability;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.mapreduce.JobContext;
@@ -53,6 +54,15 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Mutation> implemen
   /** Job parameter that specifies the output table. */
   public static final String OUTPUT_TABLE = "hbase.mapred.outputtable";
 
+  /** Property value to use write-ahead logging */
+  public static final boolean WAL_ON = true;
+
+  /** Property value to disable write-ahead logging */
+  public static final boolean WAL_OFF = false;
+
+  /** Set this to {@link #WAL_OFF} to turn off write-ahead logging (WAL) */
+  public static final String WAL_PROPERTY = "hbase.mapreduce.tableoutputformat.write.wal";
+
   /**
    * Prefix for configuration property overrides to apply in {@link #setConf(Configuration)}. For
    * keys matching this prefix, the prefix is stripped, and the value is set in the configuration
@@ -66,16 +76,26 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Mutation> implemen
    * Optional job parameter to specify a peer cluster. Used specifying remote cluster when copying
    * between hbase clusters (the source is picked up from <code>hbase-site.xml</code>).
    * @see TableMapReduceUtil#initTableReducerJob(String, Class, org.apache.hadoop.mapreduce.Job,
-   *      Class, String, String, String)
+   *      Class, String)
    */
   public static final String QUORUM_ADDRESS = OUTPUT_CONF_PREFIX + "quorum";
 
   /** Optional job parameter to specify peer cluster's ZK client port */
   public static final String QUORUM_PORT = OUTPUT_CONF_PREFIX + "quorum.port";
 
-  /** Optional specification of the rs class name of the peer cluster */
+  /**
+   * Optional specification of the rs class name of the peer cluster.
+   * @deprecated Since 2.5.9, 2.6.1 and 2.7.0, will be removed in 4.0.0. Does not take effect from
+   *             long ago, see HBASE-6044.
+   */
+  @Deprecated
   public static final String REGION_SERVER_CLASS = OUTPUT_CONF_PREFIX + "rs.class";
-  /** Optional specification of the rs impl name of the peer cluster */
+  /**
+   * Optional specification of the rs impl name of the peer cluster
+   * @deprecated Since 2.5.9, 2.6.1 and 2.7.0, will be removed in 4.0.0. Does not take effect from
+   *             long ago, see HBASE-6044.
+   */
+  @Deprecated
   public static final String REGION_SERVER_IMPL = OUTPUT_CONF_PREFIX + "rs.impl";
 
   /** The configuration. */
@@ -88,6 +108,7 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Mutation> implemen
 
     private Connection connection;
     private BufferedMutator mutator;
+    boolean useWriteAheadLogging;
 
     /**
      *
@@ -98,6 +119,7 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Mutation> implemen
       this.connection = ConnectionFactory.createConnection(conf);
       this.mutator = connection.getBufferedMutator(TableName.valueOf(tableName));
       LOG.info("Created table instance for " + tableName);
+      this.useWriteAheadLogging = conf.getBoolean(WAL_PROPERTY, WAL_ON);
     }
 
     /**
@@ -130,6 +152,9 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Mutation> implemen
     public void write(KEY key, Mutation value) throws IOException {
       if (!(value instanceof Put) && !(value instanceof Delete)) {
         throw new IOException("Pass a Delete or a Put");
+      }
+      if (!useWriteAheadLogging) {
+        value.setDurability(Durability.SKIP_WAL);
       }
       mutator.mutate(value);
     }
@@ -208,15 +233,9 @@ public class TableOutputFormat<KEY> extends OutputFormat<KEY, Mutation> implemen
 
     String address = otherConf.get(QUORUM_ADDRESS);
     int zkClientPort = otherConf.getInt(QUORUM_PORT, 0);
-    String serverClass = otherConf.get(REGION_SERVER_CLASS);
-    String serverImpl = otherConf.get(REGION_SERVER_IMPL);
 
     try {
       this.conf = HBaseConfiguration.createClusterConf(otherConf, address, OUTPUT_CONF_PREFIX);
-
-      if (serverClass != null) {
-        this.conf.set(HConstants.REGION_SERVER_IMPL, serverImpl);
-      }
       if (zkClientPort != 0) {
         this.conf.setInt(HConstants.ZOOKEEPER_CLIENT_PORT, zkClientPort);
       }

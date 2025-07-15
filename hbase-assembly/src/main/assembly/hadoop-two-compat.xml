@@ -38,7 +38,6 @@
         <include>org.apache.hbase:hbase-client</include>
         <include>org.apache.hbase:hbase-common</include>
         <include>org.apache.hbase:hbase-endpoint</include>
-        <include>org.apache.hbase:hbase-examples</include>
         <include>org.apache.hbase:hbase-external-blockcache</include>
         <include>org.apache.hbase:hbase-hadoop-compat</include>
         <include>org.apache.hbase:hbase-hadoop2-compat</include>
@@ -71,13 +70,11 @@
             <!-- Exclude J2EE libraries that get pulled in when building on JDK11 -->
               <exclude>com.sun.activation:javax.activation</exclude>
               <!--
-                The following artifacts are transitive dependencies of com.sun.xml.ws:jaxws-ri:pom
+                The following artifacts are transitive dependencies of com.sun.xml.ws:jaxws-rt:pom
                 They are needed to be included in lib/jdk11 to be added to classpath during
                 Java 11 runtime hence excluding from main lib.
               -->
               <exclude>com.sun.istack:istack-commons-runtime</exclude>
-              <exclude>com.sun.xml.bind:jaxb-jxc</exclude>
-              <exclude>com.sun.xml.bind:jaxb-xjc</exclude>
               <exclude>com.sun.xml.fastinfoset:FastInfoset</exclude>
               <exclude>com.sun.xml.messaging.saaj:saaj-impl</exclude>
               <exclude>com.sun.xml.stream.buffer:streambuffer</exclude>
@@ -85,12 +82,9 @@
               <exclude>jakarta.activation:jakarta.activation-api</exclude>
               <exclude>jakarta.annotation:jakarta.annotation-api</exclude>
               <exclude>jakarta.jws:jakarta.jws-api</exclude>
-              <exclude>jakarta.mail:jakarta.mail-api</exclude>
-              <exclude>jakarta.persistence:jakarta.persistence-api</exclude>
               <exclude>jakarta.xml.bind:jakarta.xml.bind-api</exclude>
               <exclude>jakarta.xml.soap:jakarta.xml.soap-api</exclude>
               <exclude>jakarta.xml.ws:jakarta.xml.ws-api</exclude>
-              <exclude>org.eclipse.persistence:*</exclude>
               <exclude>org.glassfish.external:management-api</exclude>
               <exclude>org.glassfish.gmbal:gmbal</exclude>
               <exclude>org.glassfish.ha:ha-api</exclude>
@@ -114,6 +108,11 @@
               <exclude>org.slf4j:*</exclude>
               <exclude>org.apache.logging.log4j:*</exclude>
               <exclude>io.opentelemetry.javaagent:*</exclude>
+              <!-- Exclude transitive dependencies of tomcat-jasper, not needed at runtime -->
+              <exclude>org.apache.tomcat:tomcat-juli</exclude>
+              <exclude>org.apache.tomcat:tomcat-api</exclude>
+              <exclude>org.apache.tomcat:tomcat-util-scan</exclude>
+              <exclude>org.apache.tomcat:tomcat-util</exclude>
             </excludes>
           </dependencySet>
         </dependencySets>
@@ -232,13 +231,11 @@
       <includes>
         <include>com.sun.activation:javax.activation</include>
         <!--
-          The following artifacts are transitive dependencies of com.sun.xml.ws:jaxws-ri:pom
+          The following artifacts are transitive dependencies of com.sun.xml.ws:jaxws-rt:pom
           They are needed to be included in lib/jdk11 to be added to classpath during
           Java 11 runtime
         -->
         <include>com.sun.istack:istack-commons-runtime</include>
-        <include>com.sun.xml.bind:jaxb-jxc</include>
-        <include>com.sun.xml.bind:jaxb-xjc</include>
         <include>com.sun.xml.fastinfoset:FastInfoset</include>
         <include>com.sun.xml.messaging.saaj:saaj-impl</include>
         <include>com.sun.xml.stream.buffer:streambuffer</include>
@@ -246,12 +243,9 @@
         <include>jakarta.activation:jakarta.activation-api</include>
         <include>jakarta.annotation:jakarta.annotation-api</include>
         <include>jakarta.jws:jakarta.jws-api</include>
-        <include>jakarta.mail:jakarta.mail-api</include>
-        <include>jakarta.persistence:jakarta.persistence-api</include>
         <include>jakarta.xml.bind:jakarta.xml.bind-api</include>
         <include>jakarta.xml.soap:jakarta.xml.soap-api</include>
         <include>jakarta.xml.ws:jakarta.xml.ws-api</include>
-        <include>org.eclipse.persistence:*</include>
         <include>org.glassfish.external:management-api</include>
         <include>org.glassfish.gmbal:gmbal</include>
         <include>org.glassfish.ha:ha-api</include>
@@ -259,8 +253,12 @@
         <include>org.glassfish.pfl:*</include>
         <include>org.jvnet.mimepull:mimepull</include>
         <include>org.jvnet.staxex:stax-ex</include>
-    </includes>
-  </dependencySet>
-</dependencySets>
+      </includes>
+      <excludes>
+        <!-- Exclude pom file -->
+        <exclude>com.sun.xml.ws:jaxws-rt:pom</exclude>
+      </excludes>
+    </dependencySet>
+  </dependencySets>
 
 </assembly>
